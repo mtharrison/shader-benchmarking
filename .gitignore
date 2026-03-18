@@ -1,0 +1,20 @@
+# Node and TypeScript build output
+/dist/
+/node_modules/
+
+# Native and Rust build output
+/native/index.node
+/target/
+/wasm/target/
+
+# Generated wasm package output
+/wasm/pkg/
+
+# Common transient logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS noise
+.DS_Store

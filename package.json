@@ -1,0 +1,26 @@
+{
+  "name": "sharing-memory",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rust native Node module example sharing a matrix buffer with TypeScript",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "commonjs",
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build:ts": "tsc -p tsconfig.json",
+    "build": "npm run build:native && npm run build:wasm && npm run build:ts",
+    "clean": "node scripts/clean.mjs",
+    "demo": "npm run build && node dist/demo.js",
+    "demo:gpu": "npm run build && node dist/gpu-demo.js",
+    "demo:matrix": "npm run build && node dist/matrix-aggregation-demo.js",
+    "bench": "npm run build && node dist/benchmark.js",
+    "bench:matrix": "npm run build && node dist/matrix-aggregation-benchmark.js",
+    "bench:quick": "npm run build && node dist/benchmark.js --dimension 1024 --passes 2 --samples 3 --warmup 1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
