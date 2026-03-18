@@ -1,13 +1,14 @@
 import {
   aggregateMatricesAverageColumnsAndGrandTotalInto,
   aggregateSharedF64MatricesInRust,
+  aggregateSharedF64MatricesInRustParallel,
   asF64View,
   checkedMatrixBatchCells,
   compileMatrixReductionGpuPipeline,
   createSharedF64Buffer,
   fillF64Matrices,
 } from './index';
-import { tryRunCudaMatrixBenchmark } from './cuda-matrix-runner';
+import { tryRunCudaMatrixBenchmarks } from './cuda-matrix-runner';
 
 type BenchmarkOptions = {
   matrices: number;
@@ -54,6 +55,11 @@ function main(): void {
   const jsAverageColumnSums = new Float64Array(options.cols);
   const rustAverageColumnSumsBuffer = createSharedF64Buffer(options.cols);
   const rustAverageColumnSums = asF64View(rustAverageColumnSumsBuffer, options.cols);
+  const rustParallelAverageColumnSumsBuffer = createSharedF64Buffer(options.cols);
+  const rustParallelAverageColumnSums = asF64View(
+    rustParallelAverageColumnSumsBuffer,
+    options.cols,
+  );
 
   const referenceGrandTotal = aggregateMatricesAverageColumnsAndGrandTotalInto(
     matrices,
@@ -71,6 +77,13 @@ function main(): void {
     options.cols,
     rustAverageColumnSumsBuffer,
   );
+  const rustParallelGrandTotal = aggregateSharedF64MatricesInRustParallel(
+    matricesBuffer,
+    options.matrices,
+    options.rows,
+    options.cols,
+    rustParallelAverageColumnSumsBuffer,
+  );
 
   assertSameResults(
     referenceGrandTotal,
@@ -78,6 +91,13 @@ function main(): void {
     rustGrandTotal,
     rustAverageColumnSums,
     'rust / napi',
+  );
+  assertSameResults(
+    referenceGrandTotal,
+    referenceAverageColumnSums,
+    rustParallelGrandTotal,
+    rustParallelAverageColumnSums,
+    'rust / napi parallel',
   );
 
   const tasks: BenchmarkTask[] = [
@@ -105,6 +125,18 @@ function main(): void {
         ),
       readAverageColumnSums: () => rustAverageColumnSums,
     },
+    {
+      name: 'rust / napi parallel batch aggregation',
+      run: () =>
+        aggregateSharedF64MatricesInRustParallel(
+          matricesBuffer,
+          options.matrices,
+          options.rows,
+          options.cols,
+          rustParallelAverageColumnSumsBuffer,
+        ),
+      readAverageColumnSums: () => rustParallelAverageColumnSums,
+    },
   ];
 
   console.log(
@@ -120,7 +152,7 @@ function main(): void {
     `Each run computes per-matrix column sums, averages those columns across ${options.matrices} matrices, and accumulates a grand total from the per-matrix totals.`,
   );
   console.log(
-    'If CUDA is available, the benchmark also runs a device-resident cuBLAS-backed GPU implementation; otherwise it logs an error and continues.',
+    'If CUDA is available, the benchmark also runs explicit `e2e` and `resident` cuBLAS-backed GPU rows; otherwise it logs an error and continues.',
   );
   console.log('');
 
@@ -128,7 +160,7 @@ function main(): void {
     runTask(task, options, touchedBytes, referenceGrandTotal, referenceAverageColumnSums),
   );
 
-  const gpuResult = tryRunCudaMatrixBenchmark({
+  const gpuResults = tryRunCudaMatrixBenchmarks({
     matrices: options.matrices,
     rows: options.rows,
     cols: options.cols,
@@ -136,31 +168,33 @@ function main(): void {
     samples: options.samples,
   });
 
-  if (gpuResult) {
-    if (gpuResult.grandTotal !== referenceGrandTotal) {
-      throw new Error(
-        `gpu grand total mismatch: ${gpuResult.grandTotal} !== ${referenceGrandTotal}`,
-      );
-    }
-
-    const preview = referenceAverageColumnSums.slice(0, gpuResult.averageColumnPreview.length);
-    for (let index = 0; index < gpuResult.averageColumnPreview.length; index += 1) {
-      if (gpuResult.averageColumnPreview[index] !== preview[index]) {
+  if (gpuResults) {
+    for (const gpuResult of gpuResults) {
+      if (gpuResult.grandTotal !== referenceGrandTotal) {
         throw new Error(
-          `gpu average-column preview mismatch at column ${index}: ${gpuResult.averageColumnPreview[index]} !== ${preview[index]}`,
+          `gpu grand total mismatch: ${gpuResult.grandTotal} !== ${referenceGrandTotal}`,
         );
       }
-    }
 
-    results.push({
-      name: gpuResult.name,
-      grandTotal: gpuResult.grandTotal,
-      averageMs: gpuResult.averageMs,
-      medianMs: gpuResult.medianMs,
-      minMs: gpuResult.minMs,
-      maxMs: gpuResult.maxMs,
-      gibPerSecond: gpuResult.gibPerSecond,
-    });
+      const preview = referenceAverageColumnSums.slice(0, gpuResult.averageColumnPreview.length);
+      for (let index = 0; index < gpuResult.averageColumnPreview.length; index += 1) {
+        if (gpuResult.averageColumnPreview[index] !== preview[index]) {
+          throw new Error(
+            `gpu average-column preview mismatch at column ${index}: ${gpuResult.averageColumnPreview[index]} !== ${preview[index]}`,
+          );
+        }
+      }
+
+      results.push({
+        name: gpuResult.name,
+        grandTotal: gpuResult.grandTotal,
+        averageMs: gpuResult.averageMs,
+        medianMs: gpuResult.medianMs,
+        minMs: gpuResult.minMs,
+        maxMs: gpuResult.maxMs,
+        gibPerSecond: gpuResult.gibPerSecond,
+      });
+    }
   }
 
   printResults(results);
@@ -171,8 +205,8 @@ function main(): void {
     options.cols,
   );
   console.log('');
-  if (gpuResult) {
-    console.log(`GPU device: ${gpuResult.deviceName}`);
+  if (gpuResults && gpuResults.length > 0) {
+    console.log(`GPU device: ${gpuResults[0].deviceName}`);
   }
   console.log(`GPU lowering artifact: ${gpuPipeline.stage1KernelIr.split('\n', 1)[0]}`);
   console.log(`GPU lowering artifact: ${gpuPipeline.stage2KernelIr.split('\n', 1)[0]}`);
@@ -262,21 +296,46 @@ function assertSameResults(
 
 function printResults(results: BenchmarkResult[]): void {
   const fastestAverage = Math.min(...results.map((result) => result.averageMs));
+  const headers = ['Scenario', 'avg ms', 'med ms', 'min ms', 'max ms', 'GiB/s', 'rel'];
+  const rows = results.map((result) => [
+    result.name,
+    result.averageMs.toFixed(3),
+    result.medianMs.toFixed(3),
+    result.minMs.toFixed(3),
+    result.maxMs.toFixed(3),
+    result.gibPerSecond.toFixed(2),
+    `${(result.averageMs / fastestAverage).toFixed(2)}x`,
+  ]);
+  const widths = headers.map((header, index) =>
+    Math.max(
+      header.length,
+      ...rows.map((row) => row[index].length),
+    ),
+  );
+  const rightAligned = new Set([1, 2, 3, 4, 5, 6]);
+  const border = `+${widths.map((width) => '-'.repeat(width + 2)).join('+')}+`;
 
-  for (const result of results) {
-    const relative = result.averageMs / fastestAverage;
+  console.log(border);
+  console.log(
+    `| ${headers
+      .map((header, index) =>
+        rightAligned.has(index) ? header.padStart(widths[index]) : header.padEnd(widths[index]),
+      )
+      .join(' | ')} |`,
+  );
+  console.log(border);
+
+  for (const row of rows) {
     console.log(
-      [
-        result.name.padEnd(36),
-        `avg ${result.averageMs.toFixed(3).padStart(9)} ms`,
-        `med ${result.medianMs.toFixed(3).padStart(9)} ms`,
-        `min ${result.minMs.toFixed(3).padStart(9)} ms`,
-        `max ${result.maxMs.toFixed(3).padStart(9)} ms`,
-        `${result.gibPerSecond.toFixed(2).padStart(6)} GiB/s`,
-        `${relative.toFixed(2).padStart(5)}x`,
-      ].join('  '),
+      `| ${row
+        .map((cell, index) =>
+          rightAligned.has(index) ? cell.padStart(widths[index]) : cell.padEnd(widths[index]),
+        )
+        .join(' | ')} |`,
     );
   }
+
+  console.log(border);
 }
 
 function formatMiB(bytes: number): string {

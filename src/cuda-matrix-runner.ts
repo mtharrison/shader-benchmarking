@@ -10,7 +10,10 @@ export type CudaMatrixBenchmarkOptions = {
   samples: number;
 };
 
+export type CudaMatrixBenchmarkMode = 'e2e' | 'resident';
+
 export type CudaMatrixBenchmarkResult = {
+  mode: CudaMatrixBenchmarkMode;
   name: string;
   deviceName: string;
   averageMs: number;
@@ -22,9 +25,9 @@ export type CudaMatrixBenchmarkResult = {
   averageColumnPreview: number[];
 };
 
-export function tryRunCudaMatrixBenchmark(
+export function tryRunCudaMatrixBenchmarks(
   options: CudaMatrixBenchmarkOptions,
-): CudaMatrixBenchmarkResult | null {
+): CudaMatrixBenchmarkResult[] | null {
   const rootDir = resolve(__dirname, '..');
 
   if (!hasCommand('nvidia-smi', ['-L'])) {
@@ -65,13 +68,24 @@ export function tryRunCudaMatrixBenchmark(
       },
     );
 
-    return JSON.parse(output) as CudaMatrixBenchmarkResult;
+    return JSON.parse(output) as CudaMatrixBenchmarkResult[];
   } catch (error) {
     console.error(
       `GPU benchmark failed while executing the CUDA runner.\n${formatExecError(error)}`,
     );
     return null;
   }
+}
+
+export function tryRunCudaMatrixBenchmark(
+  options: CudaMatrixBenchmarkOptions,
+): CudaMatrixBenchmarkResult | null {
+  const results = tryRunCudaMatrixBenchmarks(options);
+  if (!results || results.length === 0) {
+    return null;
+  }
+
+  return results.find((result) => result.mode === 'resident') ?? results[0];
 }
 
 function hasCommand(command: string, args: string[]): boolean {
@@ -100,7 +114,7 @@ function buildCudaRunner(rootDir: string): string | null {
   try {
     execFileSync(
       'nvcc',
-      ['-O3', '-std=c++17', sourcePath, '-lcublas', '-o', outputPath],
+      ['-O3', '-std=c++17', '-arch=sm_120', sourcePath, '-lcublas', '-o', outputPath],
       {
         cwd: rootDir,
         encoding: 'utf8',

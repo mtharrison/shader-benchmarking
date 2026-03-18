@@ -1,6 +1,7 @@
 import {
   aggregateMatricesAverageColumnsAndGrandTotal,
   aggregateSharedF64MatricesInRustAllocating,
+  aggregateSharedF64MatricesInRustParallelAllocating,
   asF64View,
   checkedMatrixBatchCells,
   compileMatrixReductionGpuPipeline,
@@ -51,6 +52,12 @@ const rustResult = aggregateSharedF64MatricesInRustAllocating(
   ROWS,
   COLS,
 );
+const rustParallelResult = aggregateSharedF64MatricesInRustParallelAllocating(
+  matricesBuffer,
+  MATRICES,
+  ROWS,
+  COLS,
+);
 const gpuPipeline = compileMatrixReductionGpuPipeline(MATRICES, ROWS, COLS);
 const gpuRun = tryRunCudaMatrixBenchmark({
   matrices: MATRICES,
@@ -61,12 +68,18 @@ const gpuRun = tryRunCudaMatrixBenchmark({
 });
 
 assertClose(rustResult.grandTotal, jsResult.grandTotal, 'grand total');
+assertClose(rustParallelResult.grandTotal, jsResult.grandTotal, 'parallel grand total');
 
 for (let index = 0; index < COLS; index += 1) {
   assertClose(
     rustResult.averageColumnSums[index],
     jsResult.averageColumnSums[index],
     `average column ${index}`,
+  );
+  assertClose(
+    rustParallelResult.averageColumnSums[index],
+    jsResult.averageColumnSums[index],
+    `parallel average column ${index}`,
   );
 }
 
@@ -90,6 +103,7 @@ printSection(
 printSection('JavaScript Grand Total', jsResult.grandTotal.toFixed(3));
 printSection('Average Column Preview', formatPreview(jsResult.averageColumnSums));
 printSection('Rust Grand Total', rustResult.grandTotal.toFixed(3));
+printSection('Rust Parallel Grand Total', rustParallelResult.grandTotal.toFixed(3));
 printSection('GPU Source', sampleMatrixReductionSourceCode());
 printSection('GPU Reduction IR', gpuPipeline.reductionIr);
 printSection('GPU Stage 1 Kernel', gpuPipeline.stage1KernelIr);

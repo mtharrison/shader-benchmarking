@@ -7,8 +7,8 @@ use napi::{Error, Result};
 use napi_derive::napi;
 
 use crate::f64_matrix::{
-    aggregate_matrix_batch, bytes_as_f64_slice, bytes_as_f64_slice_mut, checked_batch_cells,
-    f64_vec_to_bytes, fill_matrices, matrix_value,
+    aggregate_matrix_batch, aggregate_matrix_batch_parallel, bytes_as_f64_slice,
+    bytes_as_f64_slice_mut, checked_batch_cells, f64_vec_to_bytes, fill_matrices, matrix_value,
 };
 use crate::gpu_pipeline::{
     compile_gpu_pipeline, compile_matrix_reduction_pipeline, sample_gpu_map2_source,
@@ -145,6 +145,29 @@ pub fn aggregate_f64_matrix_batch(
 }
 
 #[napi]
+pub fn aggregate_f64_matrix_batch_parallel(
+    matrices_buffer: Buffer,
+    matrices: u32,
+    rows: u32,
+    cols: u32,
+    mut average_column_sums_buffer: Buffer,
+) -> Result<f64> {
+    let matrices = usize::try_from(matrices)
+        .map_err(|_| Error::from_reason("Matrix count does not fit into usize".to_string()))?;
+    let rows = usize::try_from(rows)
+        .map_err(|_| Error::from_reason("Row count does not fit into usize".to_string()))?;
+    let cols = usize::try_from(cols)
+        .map_err(|_| Error::from_reason("Column count does not fit into usize".to_string()))?;
+    let matrices_values =
+        bytes_as_f64_slice(matrices_buffer.as_ref()).map_err(Error::from_reason)?;
+    let average_column_sums =
+        bytes_as_f64_slice_mut(average_column_sums_buffer.as_mut()).map_err(Error::from_reason)?;
+
+    aggregate_matrix_batch_parallel(matrices_values, matrices, rows, cols, average_column_sums)
+        .map_err(Error::from_reason)
+}
+
+#[napi]
 pub fn aggregate_f64_matrix_batch_allocating(
     matrices_buffer: Buffer,
     matrices: u32,
@@ -161,6 +184,37 @@ pub fn aggregate_f64_matrix_batch_allocating(
         bytes_as_f64_slice(matrices_buffer.as_ref()).map_err(Error::from_reason)?;
     let mut average_column_sums = vec![0.0f64; cols];
     let grand_total = aggregate_matrix_batch(
+        matrices_values,
+        matrices,
+        rows,
+        cols,
+        &mut average_column_sums,
+    )
+    .map_err(Error::from_reason)?;
+
+    Ok(MatrixBatchAggregationResult {
+        average_column_sums: Buffer::from(f64_vec_to_bytes(average_column_sums)),
+        grand_total,
+    })
+}
+
+#[napi]
+pub fn aggregate_f64_matrix_batch_parallel_allocating(
+    matrices_buffer: Buffer,
+    matrices: u32,
+    rows: u32,
+    cols: u32,
+) -> Result<MatrixBatchAggregationResult> {
+    let matrices = usize::try_from(matrices)
+        .map_err(|_| Error::from_reason("Matrix count does not fit into usize".to_string()))?;
+    let rows = usize::try_from(rows)
+        .map_err(|_| Error::from_reason("Row count does not fit into usize".to_string()))?;
+    let cols = usize::try_from(cols)
+        .map_err(|_| Error::from_reason("Column count does not fit into usize".to_string()))?;
+    let matrices_values =
+        bytes_as_f64_slice(matrices_buffer.as_ref()).map_err(Error::from_reason)?;
+    let mut average_column_sums = vec![0.0f64; cols];
+    let grand_total = aggregate_matrix_batch_parallel(
         matrices_values,
         matrices,
         rows,

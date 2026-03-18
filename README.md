@@ -93,9 +93,9 @@ Because the JavaScript and Rust paths use the same deterministic formula and the
 ### What Is Implemented
 
 - A JavaScript batch generator and reducer over `Float64Array`
-- A Rust native addon that fills and aggregates the same underlying Node `Buffer`
+- A Rust native addon with both single-thread and parallel aggregation paths over the same underlying Node `Buffer`
 - A compile-only GPU-lowering artifact that emits a four-stage block-parallel reduction pipeline
-- A CUDA runtime benchmark that executes the same batched aggregation on NVIDIA hardware with a device-resident cuBLAS-backed path
+- A CUDA runtime benchmark that reports both end-to-end and device-resident cuBLAS-backed GPU rows
 
 ### End-to-End Flow
 
@@ -136,7 +136,9 @@ sequenceDiagram
     Bench->>Bench: Allocate and fill matrix batch
     Bench->>JS: Warmup and timed samples
     JS-->>Bench: Average columns + grand total
-    Bench->>Rust: Warmup and timed samples
+    Bench->>Rust: Single-thread warmup and timed samples
+    Rust-->>Bench: Average columns + grand total
+    Bench->>Rust: Parallel warmup and timed samples
     Rust-->>Bench: Average columns + grand total
     Bench->>CUDA: Check nvidia-smi and nvcc
     alt CUDA available
@@ -144,8 +146,9 @@ sequenceDiagram
         Bench->>CUDA: Run with --matrices --rows --cols --warmup --samples
         CUDA->>CUDA: Regenerate batch and CPU reference
         CUDA->>CUDA: One-time upload to device memory
-        CUDA->>CUDA: Timed cuBLAS reductions on resident data
-        CUDA->>CUDA: Copy averaged columns back once for validation
+        CUDA->>CUDA: Timed resident cuBLAS reductions
+        CUDA->>CUDA: Timed e2e copy + cuBLAS + copy row
+        CUDA->>CUDA: Copy averaged columns back once for resident validation
         CUDA-->>Bench: JSON stats + preview + grand total
     else CUDA unavailable
         CUDA-->>Bench: Log error and skip GPU row
@@ -170,6 +173,8 @@ The TypeScript implementation lives in `src/f64-matrix.ts`. It:
 The Rust implementation lives in `native/src/f64_matrix.rs` and is exposed through `native/src/lib.rs`. It:
 
 - fills an existing Node `Buffer` as `f64`
+- exposes a single-thread baseline reducer
+- exposes a Rayon-backed parallel reducer that computes matrices independently in parallel and combines results back in deterministic matrix order
 - aggregates into an output buffer of averaged column sums
 - returns the `grandTotal` as `f64`
 - matches the JavaScript path’s value formula and accumulation order
@@ -187,7 +192,7 @@ The compiler prototype lives in `native/src/gpu_pipeline.rs`. For the batch aggr
 - `stage2KernelIr` for `average_columns_f64`
 - `stage3KernelIr` for `matrix_totals_f64`
 - `stage4KernelIr` for `grand_total_f64`
-- PTX-like text for the four stages
+- PTX-like text for the four stages, currently targeted at `sm_120`
 - a host-side launch sketch
 
 This artifact is inspection-only in the local workspace. It exists to show where a real compiler would branch away from Cranelift and into a GPU-specific lowering path.
@@ -199,12 +204,13 @@ The executable CUDA path lives in `cuda/matrix_reduction_runner.cu` and is launc
 The execution flow is:
 
 1. Node checks `nvidia-smi` and `nvcc`.
-2. If needed, Node compiles `cuda/matrix_reduction_runner.cu` with `nvcc -lcublas`.
+2. If needed, Node compiles `cuda/matrix_reduction_runner.cu` with `nvcc -arch=sm_120 -lcublas`.
 3. Node launches the CUDA runner with `--matrices`, `--rows`, `--cols`, `--warmup`, and `--samples`.
 4. The CUDA process regenerates the same deterministic matrix batch in its own host memory.
 5. The CUDA process uploads the matrices and `1.0` reduction vectors to device memory once before warmup.
-6. Each timed sample runs a cuBLAS-backed reduction pipeline over device-resident data.
-7. After the timed samples, the CUDA process copies back the averaged columns, validates them against its CPU reference, and returns JSON timing data to Node.
+6. One timed mode runs a cuBLAS-backed reduction pipeline over device-resident data.
+7. A second timed mode copies the batch to device memory, runs the same cuBLAS pipeline, and copies the outputs back every sample.
+8. After the timed samples, the CUDA process validates results against its CPU reference and returns both GPU rows to Node.
 
 The runtime path is cuBLAS-backed:
 
@@ -213,11 +219,14 @@ The runtime path is cuBLAS-backed:
 - stage 3: `cublasDgemv` with transpose computes one total per matrix
 - stage 4: `cublasDdot` sums the per-matrix totals into `grandTotal`
 
-Important detail: the CUDA runner still does not consume the exact Node `Buffer`. It regenerates the same deterministic batch inside the CUDA process. Also, the timed GPU row is now intentionally device-resident: the one-time host-to-device upload and the final device-to-host copy are outside the timed sample window so the benchmark reflects the GPU compute path rather than PCIe overhead.
+Important detail: the CUDA runner still does not consume the exact Node `Buffer`. It regenerates the same deterministic batch inside the CUDA process. The benchmark now emits two GPU rows on CUDA machines:
+
+- `gpu / cuda e2e batch aggregation (cuBLAS)`: includes per-sample host-to-device and device-to-host transfers
+- `gpu / cuda resident batch aggregation (cuBLAS)`: excludes those per-sample transfers so it reflects steady-state device compute
 
 ### What The CUDA Timing Includes
 
-The GPU row now measures device-resident compute for each sample:
+The resident GPU row measures:
 
 - batched matrix-to-column reduction with cuBLAS
 - averaged-column reduction across matrices
@@ -235,7 +244,15 @@ It does not include:
 - Node build time
 - native addon build time
 
-If you want an end-to-end PCIe-included GPU row as well, that is a separate benchmark mode to add. The current CUDA row is intentionally the “push the GPU” path.
+The end-to-end GPU row measures:
+
+- host-to-device upload of the matrix batch each sample
+- the same cuBLAS reduction pipeline
+- device-to-host copy of `averageColumnSums` and `grandTotal` each sample
+
+It still excludes one-time setup like `nvcc` compilation, cuBLAS handle creation, and the upload of constant reduction vectors.
+
+That split is intentional: `e2e` answers the fairness question against host-resident CPU work, while `resident` answers the peak steady-state GPU question.
 
 ## Running The Matrix Experiment
 
@@ -250,7 +267,8 @@ The demo prints:
 - sample deterministic matrix values
 - the JavaScript `grandTotal`
 - a preview of the first averaged columns
-- the Rust `grandTotal`
+- the Rust single-thread `grandTotal`
+- the Rust parallel `grandTotal`
 - the GPU lowering source, reduction IR, four stage kernels, and host launch sketch
 - the CUDA runtime result if an NVIDIA GPU and CUDA toolkit are available
 
@@ -294,6 +312,8 @@ The benchmark prints one row per successful implementation:
 
 - `js / f64 batch aggregation`
 - `rust / napi batch aggregation`
+- `rust / napi parallel batch aggregation`
+- `gpu / cuda e2e batch aggregation (cuBLAS)` when CUDA is available
 - `gpu / cuda resident batch aggregation (cuBLAS)` when CUDA is available
 
 Each row reports:
@@ -301,7 +321,7 @@ Each row reports:
 - `avg`: arithmetic mean across timed samples
 - `med`: median sample
 - `min` / `max`: best and worst sample
-- `GiB/s`: rough effective throughput based on the logical device-side reduction traffic
+- `GiB/s`: rough effective throughput for the work included in that row's timed window
 - relative slowdown compared with the fastest row in that run
 
 After the timing table, the benchmark also prints:
@@ -318,10 +338,11 @@ The most recent local run in this workspace, using the default `4 x 1000 x 1000`
 
 | Scenario | avg ms | median | min | max | GiB/s | relative |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `js / f64 batch aggregation` | 4.012 | 4.024 | 3.914 | 4.152 | 7.43 | 1.84x |
-| `rust / napi batch aggregation` | 2.178 | 2.185 | 2.098 | 2.316 | 13.69 | 1.00x |
+| `js / f64 batch aggregation` | 3.867 | 3.826 | 3.800 | 4.024 | 7.71 | 7.09x |
+| `rust / napi batch aggregation` | 2.110 | 2.123 | 2.052 | 2.192 | 14.12 | 3.87x |
+| `rust / napi parallel batch aggregation` | 0.545 | 0.531 | 0.518 | 0.596 | 54.65 | 1.00x |
 
-That run skipped the CUDA row because the local machine had no visible NVIDIA runtime.
+That run skipped both CUDA rows because the local machine had no visible NVIDIA runtime.
 
 ## NVIDIA Requirements
 

@@ -37,7 +37,20 @@ type NativeBindings = {
     cols: number,
     averageColumnSumsBuffer: Buffer,
   ): number;
+  aggregateF64MatrixBatchParallel(
+    matricesBuffer: Buffer,
+    matrices: number,
+    rows: number,
+    cols: number,
+    averageColumnSumsBuffer: Buffer,
+  ): number;
   aggregateF64MatrixBatchAllocating(
+    matricesBuffer: Buffer,
+    matrices: number,
+    rows: number,
+    cols: number,
+  ): NativeMatrixBatchAggregationResult;
+  aggregateF64MatrixBatchParallelAllocating(
     matricesBuffer: Buffer,
     matrices: number,
     rows: number,
@@ -192,6 +205,23 @@ export function aggregateSharedF64MatricesInRust(
   );
 }
 
+export function aggregateSharedF64MatricesInRustParallel(
+  matricesBuffer: Buffer,
+  matrices: number,
+  rows: number,
+  cols: number,
+  averageColumnSumsBuffer: Buffer,
+): number {
+  checkedMatrixBatchCells(matrices, rows, cols);
+  return native.aggregateF64MatrixBatchParallel(
+    matricesBuffer,
+    matrices,
+    rows,
+    cols,
+    averageColumnSumsBuffer,
+  );
+}
+
 export function aggregateSharedF64MatricesInRustAllocating(
   matricesBuffer: Buffer,
   matrices: number,
@@ -200,6 +230,26 @@ export function aggregateSharedF64MatricesInRustAllocating(
 ): MatrixBatchAggregation {
   checkedMatrixBatchCells(matrices, rows, cols);
   const result = native.aggregateF64MatrixBatchAllocating(
+    matricesBuffer,
+    matrices,
+    rows,
+    cols,
+  );
+
+  return {
+    averageColumnSums: asF64View(result.averageColumnSums, cols),
+    grandTotal: result.grandTotal,
+  };
+}
+
+export function aggregateSharedF64MatricesInRustParallelAllocating(
+  matricesBuffer: Buffer,
+  matrices: number,
+  rows: number,
+  cols: number,
+): MatrixBatchAggregation {
+  checkedMatrixBatchCells(matrices, rows, cols);
+  const result = native.aggregateF64MatrixBatchParallelAllocating(
     matricesBuffer,
     matrices,
     rows,

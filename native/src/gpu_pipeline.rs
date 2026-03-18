@@ -829,7 +829,7 @@ fn emit_ptx(kernel: &KernelModule) -> Result<String, String> {
 
     let mut sections = vec![
         ".version 7.0".to_string(),
-        ".target sm_80".to_string(),
+        ".target sm_120".to_string(),
         ".address_size 64".to_string(),
         "".to_string(),
         format!(".visible .entry {}(", kernel.kernel_name),
@@ -914,7 +914,7 @@ fn emit_stage4_grand_total_kernel_ir(matrices: usize) -> String {
 
 fn emit_matrix_reduction_ptx(matrices: usize, rows: usize, cols: usize) -> String {
     format!(
-        ".version 7.0\n.target sm_80\n.address_size 64\n\n// Specialized for a batch of {matrices} float64 matrices with shape {rows}x{cols}.\n.visible .entry matrix_column_sum_f64(\n    .param .u64 matrices,\n    .param .u64 matrix_column_sums,\n    .param .u32 matrix_count,\n    .param .u32 rows,\n    .param .u32 cols\n)\n{{\n    // one block per (matrix, col); each lane accumulates a row stripe and reduces through shared memory\n    add.f64 %fd1, %fd1, %fd2;\n    bar.sync 0;\n    ret;\n}}\n\n.visible .entry average_columns_f64(\n    .param .u64 matrix_column_sums,\n    .param .u64 average_column_sums,\n    .param .u32 matrix_count,\n    .param .u32 cols\n)\n{{\n    // one block per column; each lane accumulates a matrix stripe and reduces through shared memory\n    add.f64 %fd1, %fd1, %fd2;\n    div.rn.f64 %fd3, %fd1, %fd2;\n    bar.sync 0;\n    ret;\n}}\n\n.visible .entry matrix_totals_f64(\n    .param .u64 matrix_column_sums,\n    .param .u64 matrix_totals,\n    .param .u32 matrix_count,\n    .param .u32 cols\n)\n{{\n    // one block per matrix; lanes reduce column stripes into matrix_totals[matrix]\n    add.f64 %fd1, %fd1, %fd2;\n    bar.sync 0;\n    ret;\n}}\n\n.visible .entry grand_total_f64(\n    .param .u64 matrix_totals,\n    .param .u64 grand_total,\n    .param .u32 matrix_count\n)\n{{\n    // one block reduces matrix totals into grand_total[0]\n    add.f64 %fd1, %fd1, %fd2;\n    bar.sync 0;\n    ret;\n}}"
+        ".version 7.0\n.target sm_120\n.address_size 64\n\n// Specialized for a batch of {matrices} float64 matrices with shape {rows}x{cols}.\n.visible .entry matrix_column_sum_f64(\n    .param .u64 matrices,\n    .param .u64 matrix_column_sums,\n    .param .u32 matrix_count,\n    .param .u32 rows,\n    .param .u32 cols\n)\n{{\n    // one block per (matrix, col); each lane accumulates a row stripe and reduces through shared memory\n    add.f64 %fd1, %fd1, %fd2;\n    bar.sync 0;\n    ret;\n}}\n\n.visible .entry average_columns_f64(\n    .param .u64 matrix_column_sums,\n    .param .u64 average_column_sums,\n    .param .u32 matrix_count,\n    .param .u32 cols\n)\n{{\n    // one block per column; each lane accumulates a matrix stripe and reduces through shared memory\n    add.f64 %fd1, %fd1, %fd2;\n    div.rn.f64 %fd3, %fd1, %fd2;\n    bar.sync 0;\n    ret;\n}}\n\n.visible .entry matrix_totals_f64(\n    .param .u64 matrix_column_sums,\n    .param .u64 matrix_totals,\n    .param .u32 matrix_count,\n    .param .u32 cols\n)\n{{\n    // one block per matrix; lanes reduce column stripes into matrix_totals[matrix]\n    add.f64 %fd1, %fd1, %fd2;\n    bar.sync 0;\n    ret;\n}}\n\n.visible .entry grand_total_f64(\n    .param .u64 matrix_totals,\n    .param .u64 grand_total,\n    .param .u32 matrix_count\n)\n{{\n    // one block reduces matrix totals into grand_total[0]\n    add.f64 %fd1, %fd1, %fd2;\n    bar.sync 0;\n    ret;\n}}"
     )
 }
 
