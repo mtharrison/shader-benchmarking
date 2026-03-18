@@ -103,6 +103,7 @@ if (gpuRun) {
   printSection(
     'GPU Runtime',
     [
+      `name = ${gpuRun.name}`,
       `device = ${gpuRun.deviceName}`,
       `avg_ms = ${gpuRun.averageMs.toFixed(3)}`,
       `grand_total = ${gpuRun.grandTotal.toFixed(3)}`,

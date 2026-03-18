@@ -95,7 +95,7 @@ Because the JavaScript and Rust paths use the same deterministic formula and the
 - A JavaScript batch generator and reducer over `Float64Array`
 - A Rust native addon that fills and aggregates the same underlying Node `Buffer`
 - A compile-only GPU-lowering artifact that emits a four-stage block-parallel reduction pipeline
-- A CUDA runtime benchmark that executes the same batched aggregation on NVIDIA hardware when available
+- A CUDA runtime benchmark that executes the same batched aggregation on NVIDIA hardware with a device-resident cuBLAS-backed path
 
 ### End-to-End Flow
 
@@ -116,12 +116,12 @@ flowchart TB
 
     C --> L["CUDA runner"]
     L --> M["Regenerate deterministic host batch in CUDA process"]
-    M --> N["Host-to-device copy"]
-    N --> O["Stage 1 kernel"]
-    O --> P["Stage 2 kernel"]
-    P --> Q["Stage 3 kernel"]
-    Q --> R["Stage 4 kernel"]
-    R --> S["Device-to-host copy"]
+    M --> N["One-time host-to-device upload"]
+    N --> O["cuBLAS stage 1<br/>batched column sums"]
+    O --> P["cuBLAS stage 2<br/>average columns"]
+    P --> Q["cuBLAS stage 3<br/>per-matrix totals"]
+    Q --> R["cuBLAS stage 4<br/>grand total"]
+    R --> S["One-time device-to-host validation copy"]
 ```
 
 ### Benchmark Orchestration
@@ -143,7 +143,9 @@ sequenceDiagram
         Bench->>CUDA: Build matrix_reduction_runner.cu if stale
         Bench->>CUDA: Run with --matrices --rows --cols --warmup --samples
         CUDA->>CUDA: Regenerate batch and CPU reference
-        CUDA->>CUDA: H2D copy + 4 kernels + D2H copy
+        CUDA->>CUDA: One-time upload to device memory
+        CUDA->>CUDA: Timed cuBLAS reductions on resident data
+        CUDA->>CUDA: Copy averaged columns back once for validation
         CUDA-->>Bench: JSON stats + preview + grand total
     else CUDA unavailable
         CUDA-->>Bench: Log error and skip GPU row
@@ -197,39 +199,43 @@ The executable CUDA path lives in `cuda/matrix_reduction_runner.cu` and is launc
 The execution flow is:
 
 1. Node checks `nvidia-smi` and `nvcc`.
-2. If needed, Node compiles `cuda/matrix_reduction_runner.cu` with `nvcc`.
+2. If needed, Node compiles `cuda/matrix_reduction_runner.cu` with `nvcc -lcublas`.
 3. Node launches the CUDA runner with `--matrices`, `--rows`, `--cols`, `--warmup`, and `--samples`.
 4. The CUDA process regenerates the same deterministic matrix batch in its own host memory.
-5. Each timed sample copies that host batch to the GPU, launches four kernels, synchronizes, and copies back the averaged columns plus the grand total.
-6. The CUDA process validates GPU results against its CPU reference and returns JSON timing data to Node.
+5. The CUDA process uploads the matrices and `1.0` reduction vectors to device memory once before warmup.
+6. Each timed sample runs a cuBLAS-backed reduction pipeline over device-resident data.
+7. After the timed samples, the CUDA process copies back the averaged columns, validates them against its CPU reference, and returns JSON timing data to Node.
 
-The four CUDA kernels are:
+The runtime path is cuBLAS-backed:
 
-- `matrix_column_sum_f64`: one block per `(matrix, column)`, with threads reducing rows cooperatively
-- `average_columns_f64`: one block per column, with threads reducing across matrices
-- `matrix_totals_f64`: one block per matrix, with threads reducing across columns
-- `grand_total_f64`: one block reducing the per-matrix totals
+- stage 1: `cublasDgemmStridedBatched` computes one column-sum vector per matrix from the row-major batch
+- stage 2: `cublasDgemv` averages those column sums across matrices
+- stage 3: `cublasDgemv` with transpose computes one total per matrix
+- stage 4: `cublasDdot` sums the per-matrix totals into `grandTotal`
 
-Important detail: the CUDA runner does not currently consume the exact Node `Buffer`. It regenerates the same deterministic batch inside the CUDA process, then measures transfer from that host memory to device memory. That still includes the host-to-device and device-to-host transfer cost in the timed GPU row.
+Important detail: the CUDA runner still does not consume the exact Node `Buffer`. It regenerates the same deterministic batch inside the CUDA process. Also, the timed GPU row is now intentionally device-resident: the one-time host-to-device upload and the final device-to-host copy are outside the timed sample window so the benchmark reflects the GPU compute path rather than PCIe overhead.
 
 ### What The CUDA Timing Includes
 
-The GPU row measures end-to-end visible work for each sample:
+The GPU row now measures device-resident compute for each sample:
 
-- host-to-device copy of the matrix batch
-- kernel launch for per-matrix column sums
-- kernel launch for averaged columns
-- kernel launch for per-matrix totals
-- kernel launch for the grand total
+- batched matrix-to-column reduction with cuBLAS
+- averaged-column reduction across matrices
+- per-matrix total reduction
+- final total reduction
 - device synchronization
-- device-to-host copy of `averageColumnSums`
-- device-to-host copy of `grandTotal`
 
 It does not include:
 
+- the one-time host-to-device upload of the matrix batch
+- the one-time upload of the reduction vectors
+- the final device-to-host copy of `averageColumnSums`
+- the final device-to-host copy of `grandTotal`
 - `nvcc` compilation time
 - Node build time
 - native addon build time
+
+If you want an end-to-end PCIe-included GPU row as well, that is a separate benchmark mode to add. The current CUDA row is intentionally the “push the GPU” path.
 
 ## Running The Matrix Experiment
 
@@ -288,14 +294,14 @@ The benchmark prints one row per successful implementation:
 
 - `js / f64 batch aggregation`
 - `rust / napi batch aggregation`
-- `gpu / cuda batch aggregation (h2d + d2h)` when CUDA is available
+- `gpu / cuda resident batch aggregation (cuBLAS)` when CUDA is available
 
 Each row reports:
 
 - `avg`: arithmetic mean across timed samples
 - `med`: median sample
 - `min` / `max`: best and worst sample
-- `GiB/s`: rough effective throughput based on the batch plus returned outputs
+- `GiB/s`: rough effective throughput based on the logical device-side reduction traffic
 - relative slowdown compared with the fastest row in that run
 
 After the timing table, the benchmark also prints:

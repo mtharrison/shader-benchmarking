@@ -1,3 +1,4 @@
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -20,7 +21,6 @@ constexpr unsigned int kDefaultRows = 1000;
 constexpr unsigned int kDefaultCols = 1000;
 constexpr unsigned int kDefaultWarmup = 3;
 constexpr unsigned int kDefaultSamples = 10;
-constexpr unsigned int kReductionBlockSize = 256;
 constexpr std::size_t kPreviewColumns = 5;
 
 struct Options {
@@ -47,6 +47,38 @@ void check_cuda(cudaError_t status, const char* expr) {
 }
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr)
+
+const char* cublas_status_name(cublasStatus_t status) {
+  switch (status) {
+    case CUBLAS_STATUS_SUCCESS:
+      return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+      return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED:
+      return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE:
+      return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+      return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR:
+      return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+      return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+      return "CUBLAS_STATUS_INTERNAL_ERROR";
+    default:
+      return "CUBLAS_STATUS_UNKNOWN";
+  }
+}
+
+void check_cublas(cublasStatus_t status, const char* expr) {
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    throw std::runtime_error(std::string("cuBLAS error: ") + cublas_status_name(status) +
+                             " while executing `" + expr + "`");
+  }
+}
+
+#define CHECK_CUBLAS(expr) check_cublas((expr), #expr)
 
 double matrix_value(std::size_t matrix, std::size_t row, std::size_t col) {
   return (static_cast<double>(matrix) * 0.75) +
@@ -218,107 +250,6 @@ std::string format_preview(const std::vector<double>& values) {
   return preview.str();
 }
 
-__device__ double block_reduce_sum(double partial, double* partials) {
-  partials[threadIdx.x] = partial;
-  __syncthreads();
-
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      partials[threadIdx.x] += partials[threadIdx.x + stride];
-    }
-
-    __syncthreads();
-  }
-
-  return partials[0];
-}
-
-__global__ void matrix_column_sum_f64(const double* matrices,
-                                      double* matrix_column_sums,
-                                      unsigned int matrix_count,
-                                      unsigned int rows,
-                                      unsigned int cols) {
-  const unsigned int linear = blockIdx.x;
-  const unsigned int total_columns = matrix_count * cols;
-
-  if (linear < total_columns) {
-    const unsigned int matrix = linear / cols;
-    const unsigned int col = linear % cols;
-    const std::size_t cells_per_matrix = static_cast<std::size_t>(rows) * cols;
-    const std::size_t matrix_offset = static_cast<std::size_t>(matrix) * cells_per_matrix;
-    extern __shared__ double partials[];
-    double partial = 0.0;
-
-    for (unsigned int row = threadIdx.x; row < rows; row += blockDim.x) {
-      partial += matrices[matrix_offset + (static_cast<std::size_t>(row) * cols) + col];
-    }
-
-    const double reduced = block_reduce_sum(partial, partials);
-    if (threadIdx.x == 0) {
-      matrix_column_sums[linear] = reduced;
-    }
-  }
-}
-
-__global__ void average_columns_f64(const double* matrix_column_sums,
-                                    double* average_column_sums,
-                                    unsigned int matrix_count,
-                                    unsigned int cols) {
-  const unsigned int col = blockIdx.x;
-
-  if (col < cols) {
-    extern __shared__ double partials[];
-    double partial = 0.0;
-
-    for (unsigned int matrix = threadIdx.x; matrix < matrix_count; matrix += blockDim.x) {
-      partial += matrix_column_sums[(static_cast<std::size_t>(matrix) * cols) + col];
-    }
-
-    const double reduced = block_reduce_sum(partial, partials);
-    if (threadIdx.x == 0) {
-      average_column_sums[col] = reduced / static_cast<double>(matrix_count);
-    }
-  }
-}
-
-__global__ void matrix_totals_f64(const double* matrix_column_sums,
-                                  double* matrix_totals,
-                                  unsigned int matrix_count,
-                                  unsigned int cols) {
-  const unsigned int matrix = blockIdx.x;
-
-  if (matrix < matrix_count) {
-    extern __shared__ double partials[];
-    double partial = 0.0;
-    const std::size_t row_offset = static_cast<std::size_t>(matrix) * cols;
-
-    for (unsigned int col = threadIdx.x; col < cols; col += blockDim.x) {
-      partial += matrix_column_sums[row_offset + col];
-    }
-
-    const double reduced = block_reduce_sum(partial, partials);
-    if (threadIdx.x == 0) {
-      matrix_totals[matrix] = reduced;
-    }
-  }
-}
-
-__global__ void grand_total_f64(const double* matrix_totals,
-                                double* grand_total,
-                                unsigned int matrix_count) {
-  extern __shared__ double partials[];
-  double partial = 0.0;
-
-  for (unsigned int matrix = threadIdx.x; matrix < matrix_count; matrix += blockDim.x) {
-    partial += matrix_totals[matrix];
-  }
-
-  const double reduced = block_reduce_sum(partial, partials);
-  if (threadIdx.x == 0) {
-    grand_total[0] = reduced;
-  }
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -348,6 +279,9 @@ int main(int argc, char** argv) {
         static_cast<std::size_t>(options.matrices) * sizeof(double);
 
     std::vector<double> host_matrices(cells);
+    std::vector<double> host_ones_rows(options.rows, 1.0);
+    std::vector<double> host_ones_cols(options.cols, 1.0);
+    std::vector<double> host_ones_matrices(options.matrices, 1.0);
     std::vector<double> reference_average_column_sums(options.cols);
     std::vector<double> gpu_average_column_sums(options.cols);
     double gpu_grand_total = 0.0;
@@ -361,68 +295,116 @@ int main(int argc, char** argv) {
         reference_average_column_sums);
 
     double* device_matrices = nullptr;
+    double* device_ones_rows = nullptr;
+    double* device_ones_cols = nullptr;
+    double* device_ones_matrices = nullptr;
     double* device_matrix_column_sums = nullptr;
     double* device_average_column_sums = nullptr;
     double* device_matrix_totals = nullptr;
     double* device_grand_total = nullptr;
+    double* device_alpha_one = nullptr;
+    double* device_beta_zero = nullptr;
+    double* device_alpha_average = nullptr;
     CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_matrices), matrix_bytes));
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_ones_rows),
+                          static_cast<std::size_t>(options.rows) * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_ones_cols),
+                          static_cast<std::size_t>(options.cols) * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_ones_matrices),
+                          static_cast<std::size_t>(options.matrices) * sizeof(double)));
     CHECK_CUDA(
         cudaMalloc(reinterpret_cast<void**>(&device_matrix_column_sums), matrix_column_sum_bytes));
     CHECK_CUDA(
         cudaMalloc(reinterpret_cast<void**>(&device_average_column_sums), average_column_bytes));
     CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_matrix_totals), matrix_total_bytes));
     CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_grand_total), sizeof(double)));
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_alpha_one), sizeof(double)));
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_beta_zero), sizeof(double)));
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_alpha_average), sizeof(double)));
+    CHECK_CUDA(cudaMemcpy(
+        device_matrices, host_matrices.data(), matrix_bytes, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(device_ones_rows,
+                          host_ones_rows.data(),
+                          static_cast<std::size_t>(options.rows) * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(device_ones_cols,
+                          host_ones_cols.data(),
+                          static_cast<std::size_t>(options.cols) * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(device_ones_matrices,
+                          host_ones_matrices.data(),
+                          static_cast<std::size_t>(options.matrices) * sizeof(double),
+                          cudaMemcpyHostToDevice));
 
-    const dim3 block(kReductionBlockSize);
-    const std::size_t reduction_shared_bytes = static_cast<std::size_t>(block.x) * sizeof(double);
-    const dim3 column_sum_grid(static_cast<unsigned int>(
-        static_cast<std::size_t>(options.matrices) * options.cols));
-    const dim3 average_columns_grid(options.cols);
-    const dim3 matrix_totals_grid(options.matrices);
+    cublasHandle_t handle = nullptr;
+    CHECK_CUBLAS(cublasCreate(&handle));
+
+    const double alpha_one = 1.0;
+    const double beta_zero = 0.0;
+    const double alpha_average = 1.0 / static_cast<double>(options.matrices);
+    CHECK_CUDA(cudaMemcpy(device_alpha_one, &alpha_one, sizeof(double), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(device_beta_zero, &beta_zero, sizeof(double), cudaMemcpyHostToDevice));
+    CHECK_CUDA(
+        cudaMemcpy(device_alpha_average, &alpha_average, sizeof(double), cudaMemcpyHostToDevice));
+    CHECK_CUBLAS(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE));
 
     auto run_once = [&]() -> double {
       const auto started_at = std::chrono::steady_clock::now();
 
-      CHECK_CUDA(cudaMemcpy(
-          device_matrices, host_matrices.data(), matrix_bytes, cudaMemcpyHostToDevice));
+      CHECK_CUBLAS(cublasDgemmStridedBatched(handle,
+                                             CUBLAS_OP_N,
+                                             CUBLAS_OP_N,
+                                             static_cast<int>(options.cols),
+                                             1,
+                                             static_cast<int>(options.rows),
+                                             device_alpha_one,
+                                             device_matrices,
+                                             static_cast<int>(options.cols),
+                                             static_cast<long long>(cells_per_matrix),
+                                             device_ones_rows,
+                                             static_cast<int>(options.rows),
+                                             0,
+                                             device_beta_zero,
+                                             device_matrix_column_sums,
+                                             static_cast<int>(options.cols),
+                                             static_cast<long long>(options.cols),
+                                             static_cast<int>(options.matrices)));
 
-      matrix_column_sum_f64<<<column_sum_grid, block, reduction_shared_bytes>>>(
-          device_matrices,
-          device_matrix_column_sums,
-          options.matrices,
-          options.rows,
-          options.cols);
-      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUBLAS(cublasDgemv(handle,
+                               CUBLAS_OP_N,
+                               static_cast<int>(options.cols),
+                               static_cast<int>(options.matrices),
+                               device_alpha_average,
+                               device_matrix_column_sums,
+                               static_cast<int>(options.cols),
+                               device_ones_matrices,
+                               1,
+                               device_beta_zero,
+                               device_average_column_sums,
+                               1));
 
-      average_columns_f64<<<average_columns_grid, block, reduction_shared_bytes>>>(
-          device_matrix_column_sums,
-          device_average_column_sums,
-          options.matrices,
-          options.cols);
-      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUBLAS(cublasDgemv(handle,
+                               CUBLAS_OP_T,
+                               static_cast<int>(options.cols),
+                               static_cast<int>(options.matrices),
+                               device_alpha_one,
+                               device_matrix_column_sums,
+                               static_cast<int>(options.cols),
+                               device_ones_cols,
+                               1,
+                               device_beta_zero,
+                               device_matrix_totals,
+                               1));
 
-      matrix_totals_f64<<<matrix_totals_grid, block, reduction_shared_bytes>>>(
-          device_matrix_column_sums,
-          device_matrix_totals,
-          options.matrices,
-          options.cols);
-      CHECK_CUDA(cudaGetLastError());
-
-      grand_total_f64<<<1, block, reduction_shared_bytes>>>(
-          device_matrix_totals, device_grand_total, options.matrices);
-      CHECK_CUDA(cudaGetLastError());
+      CHECK_CUBLAS(cublasDdot(handle,
+                              static_cast<int>(options.matrices),
+                              device_matrix_totals,
+                              1,
+                              device_ones_matrices,
+                              1,
+                              device_grand_total));
 
       CHECK_CUDA(cudaDeviceSynchronize());
-      CHECK_CUDA(cudaMemcpy(
-          gpu_average_column_sums.data(),
-          device_average_column_sums,
-          average_column_bytes,
-          cudaMemcpyDeviceToHost));
-      CHECK_CUDA(cudaMemcpy(
-          &gpu_grand_total,
-          device_grand_total,
-          sizeof(double),
-          cudaMemcpyDeviceToHost));
 
       const auto finished_at = std::chrono::steady_clock::now();
       return std::chrono::duration<double, std::milli>(finished_at - started_at).count();
@@ -438,27 +420,35 @@ int main(int argc, char** argv) {
 
     for (unsigned int iteration = 0; iteration < options.samples; iteration += 1) {
       samples_ms.push_back(run_once());
+    }
 
-      if (gpu_grand_total != reference_grand_total) {
-        std::cerr << "GPU grand total mismatch: " << gpu_grand_total << " != "
-                  << reference_grand_total << std::endl;
-        return 3;
-      }
+    CHECK_CUDA(cudaMemcpy(gpu_average_column_sums.data(),
+                          device_average_column_sums,
+                          average_column_bytes,
+                          cudaMemcpyDeviceToHost));
+    CHECK_CUDA(
+        cudaMemcpy(&gpu_grand_total, device_grand_total, sizeof(double), cudaMemcpyDeviceToHost));
 
-      if (gpu_average_column_sums != reference_average_column_sums) {
-        std::cerr << "GPU averaged column sums mismatch" << std::endl;
-        return 4;
-      }
+    if (gpu_grand_total != reference_grand_total) {
+      std::cerr << "GPU grand total mismatch: " << gpu_grand_total << " != "
+                << reference_grand_total << std::endl;
+      return 3;
+    }
+
+    if (gpu_average_column_sums != reference_average_column_sums) {
+      std::cerr << "GPU averaged column sums mismatch" << std::endl;
+      return 4;
     }
 
     const Stats stats = compute_stats(samples_ms);
-    const double touched_bytes = static_cast<double>(matrix_bytes + average_column_bytes +
-                                                     sizeof(double));
+    const double touched_bytes =
+        static_cast<double>(matrix_bytes + (3 * matrix_column_sum_bytes) +
+                            average_column_bytes + (2 * matrix_total_bytes) + sizeof(double));
     const double gib_per_second =
         touched_bytes / (1024.0 * 1024.0 * 1024.0) / (stats.average_ms / 1000.0);
 
     std::cout << "{";
-    std::cout << "\"name\":\"gpu / cuda batch aggregation (h2d + d2h)\",";
+    std::cout << "\"name\":\"gpu / cuda resident batch aggregation (cuBLAS)\",";
     std::cout << "\"deviceName\":\"" << escape_json(device.name) << "\",";
     std::cout << "\"averageMs\":" << std::setprecision(17) << stats.average_ms << ",";
     std::cout << "\"medianMs\":" << std::setprecision(17) << stats.median_ms << ",";
@@ -469,10 +459,17 @@ int main(int argc, char** argv) {
     std::cout << "\"averageColumnPreview\":" << format_preview(gpu_average_column_sums);
     std::cout << "}" << std::endl;
 
+    CHECK_CUBLAS(cublasDestroy(handle));
+    CHECK_CUDA(cudaFree(device_alpha_average));
+    CHECK_CUDA(cudaFree(device_beta_zero));
+    CHECK_CUDA(cudaFree(device_alpha_one));
     CHECK_CUDA(cudaFree(device_grand_total));
     CHECK_CUDA(cudaFree(device_matrix_totals));
     CHECK_CUDA(cudaFree(device_average_column_sums));
     CHECK_CUDA(cudaFree(device_matrix_column_sums));
+    CHECK_CUDA(cudaFree(device_ones_matrices));
+    CHECK_CUDA(cudaFree(device_ones_cols));
+    CHECK_CUDA(cudaFree(device_ones_rows));
     CHECK_CUDA(cudaFree(device_matrices));
     return 0;
   } catch (const std::exception& error) {

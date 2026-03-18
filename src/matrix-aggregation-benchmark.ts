@@ -120,7 +120,7 @@ function main(): void {
     `Each run computes per-matrix column sums, averages those columns across ${options.matrices} matrices, and accumulates a grand total from the per-matrix totals.`,
   );
   console.log(
-    'If CUDA is available, the benchmark also runs the GPU implementation; otherwise it logs an error and continues.',
+    'If CUDA is available, the benchmark also runs a device-resident cuBLAS-backed GPU implementation; otherwise it logs an error and continues.',
   );
   console.log('');
 

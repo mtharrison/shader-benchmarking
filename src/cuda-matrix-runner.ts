@@ -100,7 +100,7 @@ function buildCudaRunner(rootDir: string): string | null {
   try {
     execFileSync(
       'nvcc',
-      ['-O3', '-std=c++17', sourcePath, '-o', outputPath],
+      ['-O3', '-std=c++17', sourcePath, '-lcublas', '-o', outputPath],
       {
         cwd: rootDir,
         encoding: 'utf8',
