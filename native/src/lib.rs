@@ -7,8 +7,8 @@ use napi::{Error, Result};
 use napi_derive::napi;
 
 use crate::f64_matrix::{
-    aggregate_columns_and_total, bytes_as_f64_slice, bytes_as_f64_slice_mut, checked_cells,
-    f64_vec_to_bytes, fill_matrix, matrix_value,
+    aggregate_matrix_batch, bytes_as_f64_slice, bytes_as_f64_slice_mut, checked_batch_cells,
+    f64_vec_to_bytes, fill_matrices, matrix_value,
 };
 use crate::gpu_pipeline::{
     compile_gpu_pipeline, compile_matrix_reduction_pipeline, sample_gpu_map2_source,
@@ -24,9 +24,9 @@ const MATRIX_CELLS: usize = MATRIX_DIMENSION * MATRIX_DIMENSION;
 const MATRIX_BYTES: usize = MATRIX_CELLS * U32_BYTES;
 
 #[napi(object)]
-pub struct MatrixAggregationResult {
-    pub column_sums: Buffer,
-    pub total: f64,
+pub struct MatrixBatchAggregationResult {
+    pub average_column_sums: Buffer,
+    pub grand_total: f64,
 }
 
 #[napi]
@@ -55,14 +55,16 @@ pub fn create_f64_buffer(cells: u32) -> Result<Buffer> {
 }
 
 #[napi]
-pub fn create_f64_matrix(rows: u32, cols: u32) -> Result<Buffer> {
+pub fn create_f64_matrices(matrices: u32, rows: u32, cols: u32) -> Result<Buffer> {
+    let matrices = usize::try_from(matrices)
+        .map_err(|_| Error::from_reason("Matrix count does not fit into usize".to_string()))?;
     let rows = usize::try_from(rows)
         .map_err(|_| Error::from_reason("Row count does not fit into usize".to_string()))?;
     let cols = usize::try_from(cols)
         .map_err(|_| Error::from_reason("Column count does not fit into usize".to_string()))?;
-    let cells = checked_cells(rows, cols).map_err(Error::from_reason)?;
+    let cells = checked_batch_cells(matrices, rows, cols).map_err(Error::from_reason)?;
     let mut values = vec![0.0f64; cells];
-    fill_matrix(&mut values, rows, cols).map_err(Error::from_reason)?;
+    fill_matrices(&mut values, matrices, rows, cols).map_err(Error::from_reason)?;
 
     Ok(Buffer::from(f64_vec_to_bytes(values)))
 }
@@ -98,56 +100,78 @@ pub fn print_matrix_6x6(buffer: Buffer) -> Result<()> {
 }
 
 #[napi]
-pub fn fill_f64_matrix_buffer(mut buffer: Buffer, rows: u32, cols: u32) -> Result<()> {
+pub fn fill_f64_matrices_buffer(
+    mut buffer: Buffer,
+    matrices: u32,
+    rows: u32,
+    cols: u32,
+) -> Result<()> {
+    let matrices = usize::try_from(matrices)
+        .map_err(|_| Error::from_reason("Matrix count does not fit into usize".to_string()))?;
     let rows = usize::try_from(rows)
         .map_err(|_| Error::from_reason("Row count does not fit into usize".to_string()))?;
     let cols = usize::try_from(cols)
         .map_err(|_| Error::from_reason("Column count does not fit into usize".to_string()))?;
     let values = bytes_as_f64_slice_mut(buffer.as_mut()).map_err(Error::from_reason)?;
-    fill_matrix(values, rows, cols).map_err(Error::from_reason)
+    fill_matrices(values, matrices, rows, cols).map_err(Error::from_reason)
 }
 
 #[napi]
-pub fn f64_matrix_value(row: u32, col: u32) -> f64 {
-    matrix_value(row as usize, col as usize)
+pub fn f64_matrix_value(matrix: u32, row: u32, col: u32) -> f64 {
+    matrix_value(matrix as usize, row as usize, col as usize)
 }
 
 #[napi]
-pub fn aggregate_f64_matrix_columns(
-    matrix_buffer: Buffer,
+pub fn aggregate_f64_matrix_batch(
+    matrices_buffer: Buffer,
+    matrices: u32,
     rows: u32,
     cols: u32,
-    mut column_sums_buffer: Buffer,
+    mut average_column_sums_buffer: Buffer,
 ) -> Result<f64> {
+    let matrices = usize::try_from(matrices)
+        .map_err(|_| Error::from_reason("Matrix count does not fit into usize".to_string()))?;
     let rows = usize::try_from(rows)
         .map_err(|_| Error::from_reason("Row count does not fit into usize".to_string()))?;
     let cols = usize::try_from(cols)
         .map_err(|_| Error::from_reason("Column count does not fit into usize".to_string()))?;
-    let matrix = bytes_as_f64_slice(matrix_buffer.as_ref()).map_err(Error::from_reason)?;
-    let column_sums =
-        bytes_as_f64_slice_mut(column_sums_buffer.as_mut()).map_err(Error::from_reason)?;
+    let matrices_values =
+        bytes_as_f64_slice(matrices_buffer.as_ref()).map_err(Error::from_reason)?;
+    let average_column_sums =
+        bytes_as_f64_slice_mut(average_column_sums_buffer.as_mut()).map_err(Error::from_reason)?;
 
-    aggregate_columns_and_total(matrix, rows, cols, column_sums).map_err(Error::from_reason)
+    aggregate_matrix_batch(matrices_values, matrices, rows, cols, average_column_sums)
+        .map_err(Error::from_reason)
 }
 
 #[napi]
-pub fn aggregate_f64_matrix_columns_allocating(
-    matrix_buffer: Buffer,
+pub fn aggregate_f64_matrix_batch_allocating(
+    matrices_buffer: Buffer,
+    matrices: u32,
     rows: u32,
     cols: u32,
-) -> Result<MatrixAggregationResult> {
+) -> Result<MatrixBatchAggregationResult> {
+    let matrices = usize::try_from(matrices)
+        .map_err(|_| Error::from_reason("Matrix count does not fit into usize".to_string()))?;
     let rows = usize::try_from(rows)
         .map_err(|_| Error::from_reason("Row count does not fit into usize".to_string()))?;
     let cols = usize::try_from(cols)
         .map_err(|_| Error::from_reason("Column count does not fit into usize".to_string()))?;
-    let matrix = bytes_as_f64_slice(matrix_buffer.as_ref()).map_err(Error::from_reason)?;
-    let mut column_sums = vec![0.0f64; cols];
-    let total = aggregate_columns_and_total(matrix, rows, cols, &mut column_sums)
-        .map_err(Error::from_reason)?;
+    let matrices_values =
+        bytes_as_f64_slice(matrices_buffer.as_ref()).map_err(Error::from_reason)?;
+    let mut average_column_sums = vec![0.0f64; cols];
+    let grand_total = aggregate_matrix_batch(
+        matrices_values,
+        matrices,
+        rows,
+        cols,
+        &mut average_column_sums,
+    )
+    .map_err(Error::from_reason)?;
 
-    Ok(MatrixAggregationResult {
-        column_sums: Buffer::from(f64_vec_to_bytes(column_sums)),
-        total,
+    Ok(MatrixBatchAggregationResult {
+        average_column_sums: Buffer::from(f64_vec_to_bytes(average_column_sums)),
+        grand_total,
     })
 }
 
@@ -173,8 +197,10 @@ pub fn sample_matrix_reduction_source_code() -> String {
 
 #[napi]
 pub fn compile_matrix_reduction_gpu_pipeline(
+    matrices: u32,
     rows: u32,
     cols: u32,
 ) -> Result<CompiledMatrixReductionPipeline> {
-    compile_matrix_reduction_pipeline(rows as usize, cols as usize).map_err(Error::from_reason)
+    compile_matrix_reduction_pipeline(matrices as usize, rows as usize, cols as usize)
+        .map_err(Error::from_reason)
 }

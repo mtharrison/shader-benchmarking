@@ -1,10 +1,11 @@
 import {
-  aggregateColumnsAndTotal,
-  aggregateColumnsAndTotalInto,
+  aggregateMatricesAverageColumnsAndGrandTotal,
+  aggregateMatricesAverageColumnsAndGrandTotalInto,
+  checkedMatrixBatchCells,
   checkedMatrixCells,
-  fillF64Matrix,
+  fillF64Matrices,
   matrixValue,
-  type ColumnAggregation,
+  type MatrixBatchAggregation,
 } from './f64-matrix';
 import { asF64View } from './f64-view';
 import { fillSequence, mutateU32Array } from './mutation';
@@ -19,27 +20,35 @@ type NativeBindings = {
   createSharedMatrix(): Buffer;
   createU32Buffer(cells: number): Buffer;
   createF64Buffer(cells: number): Buffer;
-  createF64Matrix(rows: number, cols: number): Buffer;
+  createF64Matrices(matrices: number, rows: number, cols: number): Buffer;
   mutateU32Buffer(buffer: Buffer, passes: number): number;
   printMatrix6x6(buffer: Buffer): void;
-  fillF64MatrixBuffer(buffer: Buffer, rows: number, cols: number): void;
-  f64MatrixValue(row: number, col: number): number;
-  aggregateF64MatrixColumns(
-    matrixBuffer: Buffer,
+  fillF64MatricesBuffer(
+    buffer: Buffer,
+    matrices: number,
     rows: number,
     cols: number,
-    columnSumsBuffer: Buffer,
+  ): void;
+  f64MatrixValue(matrix: number, row: number, col: number): number;
+  aggregateF64MatrixBatch(
+    matricesBuffer: Buffer,
+    matrices: number,
+    rows: number,
+    cols: number,
+    averageColumnSumsBuffer: Buffer,
   ): number;
-  aggregateF64MatrixColumnsAllocating(
-    matrixBuffer: Buffer,
+  aggregateF64MatrixBatchAllocating(
+    matricesBuffer: Buffer,
+    matrices: number,
     rows: number,
     cols: number,
-  ): NativeMatrixAggregationResult;
+  ): NativeMatrixBatchAggregationResult;
   sampleGpuMap2SourceCode(): string;
   compileGpuMap2Pipeline(source: string): GpuCompilationArtifact;
   compileSampleGpuMap2(): GpuCompilationArtifact;
   sampleMatrixReductionSourceCode(): string;
   compileMatrixReductionGpuPipeline(
+    matrices: number,
     rows: number,
     cols: number,
   ): MatrixReductionGpuPipelineArtifact;
@@ -47,9 +56,9 @@ type NativeBindings = {
 
 const native = require('../native/index.node') as NativeBindings;
 
-type NativeMatrixAggregationResult = {
-  columnSums: Buffer;
-  total: number;
+type NativeMatrixBatchAggregationResult = {
+  averageColumnSums: Buffer;
+  grandTotal: number;
 };
 
 export type GpuCompilationArtifact = {
@@ -66,6 +75,8 @@ export type MatrixReductionGpuPipelineArtifact = {
   reductionIr: string;
   stage1KernelIr: string;
   stage2KernelIr: string;
+  stage3KernelIr: string;
+  stage4KernelIr: string;
   ptx: string;
   hostLaunch: string;
   notes: string[];
@@ -91,9 +102,13 @@ export function createSharedF64Buffer(cells: number): Buffer {
   return native.createF64Buffer(cells);
 }
 
-export function createSharedF64Matrix(rows: number, cols: number): Buffer {
-  checkedMatrixCells(rows, cols);
-  return native.createF64Matrix(rows, cols);
+export function createSharedF64Matrices(
+  matrices: number,
+  rows: number,
+  cols: number,
+): Buffer {
+  checkedMatrixBatchCells(matrices, rows, cols);
+  return native.createF64Matrices(matrices, rows, cols);
 }
 
 export function asMatrixView(buffer: Buffer): Uint32Array {
@@ -142,40 +157,58 @@ export function printNativeMatrix6x6(buffer: Buffer): void {
   native.printMatrix6x6(buffer);
 }
 
-export function fillSharedF64Matrix(
+export function fillSharedF64Matrices(
   buffer: Buffer,
+  matrices: number,
   rows: number,
   cols: number,
 ): void {
-  checkedMatrixCells(rows, cols);
-  native.fillF64MatrixBuffer(buffer, rows, cols);
+  checkedMatrixBatchCells(matrices, rows, cols);
+  native.fillF64MatricesBuffer(buffer, matrices, rows, cols);
 }
 
-export function nativeF64MatrixValue(row: number, col: number): number {
-  return native.f64MatrixValue(row, col);
-}
-
-export function aggregateSharedF64MatrixColumnsInRust(
-  matrixBuffer: Buffer,
-  rows: number,
-  cols: number,
-  columnSumsBuffer: Buffer,
+export function nativeF64MatrixValue(
+  matrix: number,
+  row: number,
+  col: number,
 ): number {
-  checkedMatrixCells(rows, cols);
-  return native.aggregateF64MatrixColumns(matrixBuffer, rows, cols, columnSumsBuffer);
+  return native.f64MatrixValue(matrix, row, col);
 }
 
-export function aggregateSharedF64MatrixInRust(
-  matrixBuffer: Buffer,
+export function aggregateSharedF64MatricesInRust(
+  matricesBuffer: Buffer,
+  matrices: number,
   rows: number,
   cols: number,
-): ColumnAggregation {
-  checkedMatrixCells(rows, cols);
-  const result = native.aggregateF64MatrixColumnsAllocating(matrixBuffer, rows, cols);
+  averageColumnSumsBuffer: Buffer,
+): number {
+  checkedMatrixBatchCells(matrices, rows, cols);
+  return native.aggregateF64MatrixBatch(
+    matricesBuffer,
+    matrices,
+    rows,
+    cols,
+    averageColumnSumsBuffer,
+  );
+}
+
+export function aggregateSharedF64MatricesInRustAllocating(
+  matricesBuffer: Buffer,
+  matrices: number,
+  rows: number,
+  cols: number,
+): MatrixBatchAggregation {
+  checkedMatrixBatchCells(matrices, rows, cols);
+  const result = native.aggregateF64MatrixBatchAllocating(
+    matricesBuffer,
+    matrices,
+    rows,
+    cols,
+  );
 
   return {
-    columnSums: asF64View(result.columnSums, cols),
-    total: result.total,
+    averageColumnSums: asF64View(result.averageColumnSums, cols),
+    grandTotal: result.grandTotal,
   };
 }
 
@@ -196,20 +229,22 @@ export function sampleMatrixReductionSourceCode(): string {
 }
 
 export function compileMatrixReductionGpuPipeline(
+  matrices: number,
   rows: number,
   cols: number,
 ): MatrixReductionGpuPipelineArtifact {
-  checkedMatrixCells(rows, cols);
-  return native.compileMatrixReductionGpuPipeline(rows, cols);
+  checkedMatrixBatchCells(matrices, rows, cols);
+  return native.compileMatrixReductionGpuPipeline(matrices, rows, cols);
 }
 
 export {
-  aggregateColumnsAndTotal,
-  aggregateColumnsAndTotalInto,
+  aggregateMatricesAverageColumnsAndGrandTotal,
+  aggregateMatricesAverageColumnsAndGrandTotalInto,
   asF64View,
   asU32View,
+  checkedMatrixBatchCells,
   checkedMatrixCells,
-  fillF64Matrix,
+  fillF64Matrices,
   fillSequence,
   matrixValue,
   mutateU32Array,

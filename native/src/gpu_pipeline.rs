@@ -3,7 +3,7 @@ use std::fmt::{self, Display, Formatter};
 use napi_derive::napi;
 
 const SAMPLE_GPU_MAP2_SOURCE: &str = "let out = gpu.map2(a, b, (x, y) => x + y);";
-const SAMPLE_MATRIX_REDUCTION_SOURCE: &str = "function sumColumnsThenTotal(matrix, rows, cols) {\n  const columnSums = gpu.reduceColumns(matrix, rows, cols, (acc, value) => acc + value, 0.0);\n  const total = gpu.reduce(columnSums, (acc, value) => acc + value, 0.0);\n  return { columnSums, total };\n}";
+const SAMPLE_MATRIX_REDUCTION_SOURCE: &str = "function aggregateMatrixBatch(matrices, matrixCount, rows, cols) {\n  const perMatrixColumnSums = gpu.reduceColumnsPerMatrix(matrices, matrixCount, rows, cols, (acc, value) => acc + value, 0.0);\n  const averageColumnSums = gpu.averageColumns(perMatrixColumnSums, matrixCount, cols);\n  const matrixTotals = gpu.reducePerMatrix(perMatrixColumnSums, matrixCount, cols, (acc, value) => acc + value, 0.0);\n  const grandTotal = gpu.reduce(matrixTotals, (acc, value) => acc + value, 0.0);\n  return { averageColumnSums, grandTotal };\n}";
 
 #[napi(object)]
 pub struct CompiledGpuPipeline {
@@ -21,6 +21,8 @@ pub struct CompiledMatrixReductionPipeline {
     pub reduction_ir: String,
     pub stage1_kernel_ir: String,
     pub stage2_kernel_ir: String,
+    pub stage3_kernel_ir: String,
+    pub stage4_kernel_ir: String,
     pub ptx: String,
     pub host_launch: String,
     pub notes: Vec<String>,
@@ -183,35 +185,44 @@ pub fn sample_matrix_reduction_source() -> &'static str {
 }
 
 pub fn compile_matrix_reduction_pipeline(
+    matrices: usize,
     rows: usize,
     cols: usize,
 ) -> Result<CompiledMatrixReductionPipeline, String> {
-    if rows == 0 || cols == 0 {
+    if matrices == 0 || rows == 0 || cols == 0 {
         return Err(
-            "Matrix reduction pipelines require non-zero row and column counts".to_string(),
+            "Matrix reduction pipelines require non-zero matrix, row, and column counts"
+                .to_string(),
         );
     }
 
-    let reduction_ir = emit_matrix_reduction_ir(rows, cols);
-    let stage1_kernel_ir = emit_column_sum_kernel_ir(rows, cols);
-    let stage2_kernel_ir = emit_total_sum_kernel_ir(cols);
-    let ptx = emit_matrix_reduction_ptx(rows, cols);
-    let host_launch = emit_matrix_reduction_host_launch(rows, cols);
+    let reduction_ir = emit_matrix_reduction_ir(matrices, rows, cols);
+    let stage1_kernel_ir = emit_stage1_column_sum_kernel_ir(matrices, rows, cols);
+    let stage2_kernel_ir = emit_stage2_average_columns_kernel_ir(matrices, cols);
+    let stage3_kernel_ir = emit_stage3_matrix_totals_kernel_ir(matrices, cols);
+    let stage4_kernel_ir = emit_stage4_grand_total_kernel_ir(matrices);
+    let ptx = emit_matrix_reduction_ptx(matrices, rows, cols);
+    let host_launch = emit_matrix_reduction_host_launch(matrices, rows, cols);
 
     Ok(CompiledMatrixReductionPipeline {
         source: SAMPLE_MATRIX_REDUCTION_SOURCE.to_string(),
         reduction_ir,
         stage1_kernel_ir,
         stage2_kernel_ir,
+        stage3_kernel_ir,
+        stage4_kernel_ir,
         ptx,
         host_launch,
         notes: vec![
-            "Stage 1 launches one thread per column and walks the rows in software, accumulating into a float64 column sum.".to_string(),
+            "Stage 1 launches one thread per (matrix, column) pair and produces one column-sum vector per matrix.".to_string(),
             format!(
-                "Stage 2 reduces the {cols} column sums into a single float64 total."
+                "Stage 2 averages the {cols} column sums across {matrices} matrices."
+            ),
+            format!(
+                "Stage 3 reduces each matrix's {cols} column sums into one per-matrix total, and stage 4 reduces the {matrices} matrix totals into a grand total."
             ),
             "The artifact is compile-only in this workspace because the local machine has no NVIDIA GPU or WebGPU runtime.".to_string(),
-            "In a real compiler, the host-side Cranelift path would allocate device buffers, launch both kernels, and copy the results back.".to_string(),
+            "In a real compiler, the host-side Cranelift path would allocate device buffers, launch all four kernels, and copy the averaged columns plus the grand total back.".to_string(),
         ],
     })
 }
@@ -871,41 +882,45 @@ fn emit_host_launch(kernel: &KernelModule) -> String {
     )
 }
 
-fn emit_matrix_reduction_ir(rows: usize, cols: usize) -> String {
+fn emit_matrix_reduction_ir(matrices: usize, rows: usize, cols: usize) -> String {
     format!(
-        "Pipeline matrix_column_sum_total_f64 {{\n  input matrix: buffer<f64> [{rows} x {cols}]\n  stage column_sums: reduce_columns(matrix, rows={rows}, cols={cols}, op=add, init=0.0f64)\n  stage total: reduce(column_sums, len={cols}, op=add, init=0.0f64)\n  output {{ column_sums, total }}\n}}"
+        "Pipeline matrix_batch_average_columns_and_grand_total_f64 {{\n  input matrices: buffer<f64> [{matrices} x {rows} x {cols}]\n  stage per_matrix_column_sums: reduce_columns_per_matrix(matrices, matrix_count={matrices}, rows={rows}, cols={cols}, op=add, init=0.0f64)\n  stage average_column_sums: average_columns(per_matrix_column_sums, matrix_count={matrices}, cols={cols})\n  stage matrix_totals: reduce_per_matrix(per_matrix_column_sums, matrix_count={matrices}, cols={cols}, op=add, init=0.0f64)\n  stage grand_total: reduce(matrix_totals, len={matrices}, op=add, init=0.0f64)\n  output {{ average_column_sums, grand_total }}\n}}"
     )
 }
 
-fn emit_column_sum_kernel_ir(rows: usize, cols: usize) -> String {
+fn emit_stage1_column_sum_kernel_ir(matrices: usize, rows: usize, cols: usize) -> String {
     format!(
-        "kernel matrix_column_sum_f64(\n  matrix: buffer<f64, read>,\n  column_sums: buffer<f64, write>,\n  rows: u32,\n  cols: u32\n) {{\n  let col = global_id.x;\n  if col < cols {{\n    let acc = 0.0f64;\n    for row in 0..rows {{\n      acc += matrix[row * cols + col];\n    }}\n    column_sums[col] = acc;\n  }}\n}}\n\nspecialized_for rows={rows}, cols={cols}"
+        "kernel matrix_column_sum_f64(\n  matrices: buffer<f64, read>,\n  matrix_column_sums: buffer<f64, write>,\n  matrix_count: u32,\n  rows: u32,\n  cols: u32\n) {{\n  let linear = global_id.x;\n  let total_columns = matrix_count * cols;\n  if linear < total_columns {{\n    let matrix = linear / cols;\n    let col = linear % cols;\n    let matrix_base = matrix * rows * cols;\n    let acc = 0.0f64;\n    for row in 0..rows {{\n      acc += matrices[matrix_base + row * cols + col];\n    }}\n    matrix_column_sums[linear] = acc;\n  }}\n}}\n\nspecialized_for matrix_count={matrices}, rows={rows}, cols={cols}"
     )
 }
 
-fn emit_total_sum_kernel_ir(cols: usize) -> String {
+fn emit_stage2_average_columns_kernel_ir(matrices: usize, cols: usize) -> String {
     format!(
-        "kernel matrix_total_sum_f64(\n  column_sums: buffer<f64, read>,\n  total: buffer<f64, write>,\n  cols: u32\n) {{\n  let lane = global_id.x;\n  if lane == 0 {{\n    let acc = 0.0f64;\n    for col in 0..cols {{\n      acc += column_sums[col];\n    }}\n    total[0] = acc;\n  }}\n}}\n\nspecialized_for cols={cols}"
+        "kernel average_columns_f64(\n  matrix_column_sums: buffer<f64, read>,\n  average_column_sums: buffer<f64, write>,\n  matrix_count: u32,\n  cols: u32\n) {{\n  let col = global_id.x;\n  if col < cols {{\n    let acc = 0.0f64;\n    for matrix in 0..matrix_count {{\n      acc += matrix_column_sums[matrix * cols + col];\n    }}\n    average_column_sums[col] = acc / f64(matrix_count);\n  }}\n}}\n\nspecialized_for matrix_count={matrices}, cols={cols}"
     )
 }
 
-fn emit_matrix_reduction_ptx(rows: usize, cols: usize) -> String {
-    let column_kernel = format!(
-        ".visible .entry matrix_column_sum_f64(\n    .param .u64 matrix,\n    .param .u64 column_sums,\n    .param .u32 rows,\n    .param .u32 cols\n)\n{{\n    .reg .pred %p<2>;\n    .reg .b32 %r<12>;\n    .reg .b64 %rd<16>;\n    .reg .f64 %fd<6>;\n\n    ld.param.u64 %rd1, [matrix];\n    ld.param.u64 %rd2, [column_sums];\n    ld.param.u32 %r1, [rows];\n    ld.param.u32 %r2, [cols];\n\n    mov.u32 %r3, %ctaid.x;\n    mov.u32 %r4, %ntid.x;\n    mov.u32 %r5, %tid.x;\n    mad.lo.s32 %r6, %r3, %r4, %r5;\n    setp.ge.u32 %p1, %r6, %r2;\n    @%p1 bra COL_DONE;\n\n    mov.u32 %r7, 0;\n    mov.f64 %fd1, 0d0;\nCOL_LOOP:\n    setp.ge.u32 %p1, %r7, %r1;\n    @%p1 bra COL_STORE;\n    mad.lo.s32 %r8, %r7, %r2, %r6;\n    mul.wide.u32 %rd3, %r8, 8;\n    add.s64 %rd4, %rd1, %rd3;\n    ld.global.f64 %fd2, [%rd4];\n    add.f64 %fd1, %fd1, %fd2;\n    add.u32 %r7, %r7, 1;\n    bra COL_LOOP;\nCOL_STORE:\n    mul.wide.u32 %rd5, %r6, 8;\n    add.s64 %rd6, %rd2, %rd5;\n    st.global.f64 [%rd6], %fd1;\nCOL_DONE:\n    ret;\n}}"
-    );
-
-    let total_kernel = format!(
-        ".visible .entry matrix_total_sum_f64(\n    .param .u64 column_sums,\n    .param .u64 total,\n    .param .u32 cols\n)\n{{\n    .reg .pred %p<2>;\n    .reg .b32 %r<10>;\n    .reg .b64 %rd<16>;\n    .reg .f64 %fd<6>;\n\n    ld.param.u64 %rd1, [column_sums];\n    ld.param.u64 %rd2, [total];\n    ld.param.u32 %r1, [cols];\n\n    mov.u32 %r2, %ctaid.x;\n    mov.u32 %r3, %ntid.x;\n    mov.u32 %r4, %tid.x;\n    mad.lo.s32 %r5, %r2, %r3, %r4;\n    setp.ne.u32 %p1, %r5, 0;\n    @%p1 bra TOTAL_DONE;\n\n    mov.u32 %r6, 0;\n    mov.f64 %fd1, 0d0;\nTOTAL_LOOP:\n    setp.ge.u32 %p1, %r6, %r1;\n    @%p1 bra TOTAL_STORE;\n    mul.wide.u32 %rd3, %r6, 8;\n    add.s64 %rd4, %rd1, %rd3;\n    ld.global.f64 %fd2, [%rd4];\n    add.f64 %fd1, %fd1, %fd2;\n    add.u32 %r6, %r6, 1;\n    bra TOTAL_LOOP;\nTOTAL_STORE:\n    st.global.f64 [%rd2], %fd1;\nTOTAL_DONE:\n    ret;\n}}"
-    );
-
+fn emit_stage3_matrix_totals_kernel_ir(matrices: usize, cols: usize) -> String {
     format!(
-        ".version 7.0\n.target sm_80\n.address_size 64\n\n// Specialized for a {rows}x{cols} float64 matrix.\n{column_kernel}\n\n{total_kernel}"
+        "kernel matrix_totals_f64(\n  matrix_column_sums: buffer<f64, read>,\n  matrix_totals: buffer<f64, write>,\n  matrix_count: u32,\n  cols: u32\n) {{\n  let matrix = global_id.x;\n  if matrix < matrix_count {{\n    let base = matrix * cols;\n    let acc = 0.0f64;\n    for col in 0..cols {{\n      acc += matrix_column_sums[base + col];\n    }}\n    matrix_totals[matrix] = acc;\n  }}\n}}\n\nspecialized_for matrix_count={matrices}, cols={cols}"
     )
 }
 
-fn emit_matrix_reduction_host_launch(rows: usize, cols: usize) -> String {
+fn emit_stage4_grand_total_kernel_ir(matrices: usize) -> String {
     format!(
-        "fn launch_matrix_column_sum_total_f64(\n  cuda: &CudaRuntime,\n  matrix: DeviceBuffer<f64>,\n  column_sums: DeviceBuffer<f64>,\n  total: DeviceBuffer<f64>,\n) {{\n  debug_assert_eq!(matrix.len(), {rows} * {cols});\n  debug_assert_eq!(column_sums.len(), {cols});\n  debug_assert_eq!(total.len(), 1);\n\n  let module = cuda.load_ptx(MATRIX_COLUMN_SUM_TOTAL_F64_PTX);\n  let column_kernel = module.function(\"matrix_column_sum_f64\");\n  let total_kernel = module.function(\"matrix_total_sum_f64\");\n  let block = 256u32;\n  let grid = ({cols}u32).div_ceil(block);\n\n  cuda.launch_1d(&column_kernel, grid, block, (&matrix, &column_sums, &({rows}u32), &({cols}u32)));\n  cuda.launch_1d(&total_kernel, 1, 1, (&column_sums, &total, &({cols}u32)));\n}}"
+        "kernel grand_total_f64(\n  matrix_totals: buffer<f64, read>,\n  grand_total: buffer<f64, write>,\n  matrix_count: u32\n) {{\n  let lane = global_id.x;\n  if lane == 0 {{\n    let acc = 0.0f64;\n    for matrix in 0..matrix_count {{\n      acc += matrix_totals[matrix];\n    }}\n    grand_total[0] = acc;\n  }}\n}}\n\nspecialized_for matrix_count={matrices}"
+    )
+}
+
+fn emit_matrix_reduction_ptx(matrices: usize, rows: usize, cols: usize) -> String {
+    format!(
+        ".version 7.0\n.target sm_80\n.address_size 64\n\n// Specialized for a batch of {matrices} float64 matrices with shape {rows}x{cols}.\n.visible .entry matrix_column_sum_f64(\n    .param .u64 matrices,\n    .param .u64 matrix_column_sums,\n    .param .u32 matrix_count,\n    .param .u32 rows,\n    .param .u32 cols\n)\n{{\n    // linear thread id -> (matrix, col)\n    mov.u32 %r1, %ctaid.x;\n    mov.u32 %r2, %ntid.x;\n    mov.u32 %r3, %tid.x;\n    mad.lo.s32 %r4, %r1, %r2, %r3;\n    // ... compute matrix/col, loop rows, accumulate add.f64 into matrix_column_sums[linear]\n    add.f64 %fd1, %fd1, %fd2;\n    ret;\n}}\n\n.visible .entry average_columns_f64(\n    .param .u64 matrix_column_sums,\n    .param .u64 average_column_sums,\n    .param .u32 matrix_count,\n    .param .u32 cols\n)\n{{\n    // one thread per column; sum matrix_column_sums[matrix * cols + col]\n    add.f64 %fd1, %fd1, %fd2;\n    div.rn.f64 %fd3, %fd1, %fd2;\n    ret;\n}}\n\n.visible .entry matrix_totals_f64(\n    .param .u64 matrix_column_sums,\n    .param .u64 matrix_totals,\n    .param .u32 matrix_count,\n    .param .u32 cols\n)\n{{\n    // one thread per matrix; reduce that matrix's column sums into matrix_totals[matrix]\n    add.f64 %fd1, %fd1, %fd2;\n    ret;\n}}\n\n.visible .entry grand_total_f64(\n    .param .u64 matrix_totals,\n    .param .u64 grand_total,\n    .param .u32 matrix_count\n)\n{{\n    // lane 0 reduces all matrix totals into grand_total[0]\n    add.f64 %fd1, %fd1, %fd2;\n    ret;\n}}"
+    )
+}
+
+fn emit_matrix_reduction_host_launch(matrices: usize, rows: usize, cols: usize) -> String {
+    format!(
+        "fn launch_matrix_batch_average_columns_and_grand_total_f64(\n  cuda: &CudaRuntime,\n  matrices: DeviceBuffer<f64>,\n  matrix_column_sums: DeviceBuffer<f64>,\n  average_column_sums: DeviceBuffer<f64>,\n  matrix_totals: DeviceBuffer<f64>,\n  grand_total: DeviceBuffer<f64>,\n) {{\n  debug_assert_eq!(matrices.len(), {matrices} * {rows} * {cols});\n  debug_assert_eq!(matrix_column_sums.len(), {matrices} * {cols});\n  debug_assert_eq!(average_column_sums.len(), {cols});\n  debug_assert_eq!(matrix_totals.len(), {matrices});\n  debug_assert_eq!(grand_total.len(), 1);\n\n  let module = cuda.load_ptx(MATRIX_BATCH_AVERAGE_COLUMNS_AND_GRAND_TOTAL_F64_PTX);\n  let stage1 = module.function(\"matrix_column_sum_f64\");\n  let stage2 = module.function(\"average_columns_f64\");\n  let stage3 = module.function(\"matrix_totals_f64\");\n  let stage4 = module.function(\"grand_total_f64\");\n  let block = 256u32;\n  let stage1_grid = ({matrices}u32 * {cols}u32).div_ceil(block);\n  let stage2_grid = ({cols}u32).div_ceil(block);\n  let stage3_grid = ({matrices}u32).div_ceil(block);\n\n  cuda.launch_1d(&stage1, stage1_grid, block, (&matrices, &matrix_column_sums, &({matrices}u32), &({rows}u32), &({cols}u32)));\n  cuda.launch_1d(&stage2, stage2_grid, block, (&matrix_column_sums, &average_column_sums, &({matrices}u32), &({cols}u32)));\n  cuda.launch_1d(&stage3, stage3_grid, block, (&matrix_column_sums, &matrix_totals, &({matrices}u32), &({cols}u32)));\n  cuda.launch_1d(&stage4, 1, 1, (&matrix_totals, &grand_total, &({matrices}u32)));\n}}"
     )
 }
 
@@ -979,14 +994,17 @@ mod tests {
     }
 
     #[test]
-    fn compiles_a_two_stage_matrix_reduction_pipeline() {
+    fn compiles_a_four_stage_matrix_reduction_pipeline() {
         let artifact =
-            compile_matrix_reduction_pipeline(1_000, 1_000).expect("pipeline should compile");
+            compile_matrix_reduction_pipeline(4, 1_000, 1_000).expect("pipeline should compile");
 
-        assert!(artifact.reduction_ir.contains("reduce_columns"));
+        assert!(artifact.reduction_ir.contains("average_columns"));
         assert!(artifact.stage1_kernel_ir.contains("matrix_column_sum_f64"));
-        assert!(artifact.stage2_kernel_ir.contains("matrix_total_sum_f64"));
+        assert!(artifact.stage2_kernel_ir.contains("average_columns_f64"));
+        assert!(artifact.stage3_kernel_ir.contains("matrix_totals_f64"));
+        assert!(artifact.stage4_kernel_ir.contains("grand_total_f64"));
         assert!(artifact.ptx.contains("add.f64"));
-        assert!(artifact.host_launch.contains("column_kernel"));
+        assert!(artifact.host_launch.contains("stage1"));
+        assert!(artifact.host_launch.contains("stage4"));
     }
 }

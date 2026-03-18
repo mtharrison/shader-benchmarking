@@ -1,6 +1,6 @@
-export type ColumnAggregation = {
-  columnSums: Float64Array;
-  total: number;
+export type MatrixBatchAggregation = {
+  averageColumnSums: Float64Array;
+  grandTotal: number;
 };
 
 export function checkedMatrixCells(rows: number, cols: number): number {
@@ -21,7 +21,32 @@ export function checkedMatrixCells(rows: number, cols: number): number {
   return cells;
 }
 
-export function matrixValue(row: number, col: number): number {
+export function checkedMatrixBatchCells(
+  matrices: number,
+  rows: number,
+  cols: number,
+): number {
+  if (!Number.isInteger(matrices) || matrices <= 0) {
+    throw new Error(`Expected a positive integer matrix count, got ${matrices}`);
+  }
+
+  const cellsPerMatrix = checkedMatrixCells(rows, cols);
+  const cells = matrices * cellsPerMatrix;
+
+  if (!Number.isSafeInteger(cells)) {
+    throw new Error(
+      `Matrix batch cell count overflows Number safety bounds: ${matrices} x ${rows} x ${cols}`,
+    );
+  }
+
+  return cells;
+}
+
+export function matrixValue(matrix: number, row: number, col: number): number {
+  if (!Number.isInteger(matrix) || matrix < 0) {
+    throw new Error(`Expected a non-negative integer matrix index, got ${matrix}`);
+  }
+
   if (!Number.isInteger(row) || row < 0) {
     throw new Error(`Expected a non-negative integer row index, got ${row}`);
   }
@@ -30,75 +55,106 @@ export function matrixValue(row: number, col: number): number {
     throw new Error(`Expected a non-negative integer column index, got ${col}`);
   }
 
-  return row * 0.5 + col * 0.25 + ((row ^ col) & 7) * 0.125;
+  return matrix * 0.75 + row * 0.5 + col * 0.25 + ((matrix ^ row ^ col) & 7) * 0.125;
 }
 
-export function fillF64Matrix(
+export function fillF64Matrices(
   values: Float64Array,
+  matrices: number,
   rows: number,
   cols: number,
 ): void {
-  const cells = checkedMatrixCells(rows, cols);
+  const cells = checkedMatrixBatchCells(matrices, rows, cols);
+  const cellsPerMatrix = checkedMatrixCells(rows, cols);
 
   if (values.length !== cells) {
     throw new Error(
-      `Expected exactly ${cells} f64 values for a ${rows}x${cols} matrix, got ${values.length}`,
+      `Expected exactly ${cells} f64 values for ${matrices} matrices of shape ${rows}x${cols}, got ${values.length}`,
     );
   }
 
-  for (let row = 0; row < rows; row += 1) {
-    const rowStart = row * cols;
+  for (let matrix = 0; matrix < matrices; matrix += 1) {
+    const matrixOffset = matrix * cellsPerMatrix;
 
-    for (let col = 0; col < cols; col += 1) {
-      values[rowStart + col] = matrixValue(row, col);
+    for (let row = 0; row < rows; row += 1) {
+      const rowStart = matrixOffset + row * cols;
+
+      for (let col = 0; col < cols; col += 1) {
+        values[rowStart + col] = matrixValue(matrix, row, col);
+      }
     }
   }
 }
 
-export function aggregateColumnsAndTotalInto(
+export function aggregateMatricesAverageColumnsAndGrandTotalInto(
   values: Float64Array,
+  matrices: number,
   rows: number,
   cols: number,
-  columnSums: Float64Array,
+  averageColumnSums: Float64Array,
 ): number {
-  const cells = checkedMatrixCells(rows, cols);
+  const cells = checkedMatrixBatchCells(matrices, rows, cols);
+  const cellsPerMatrix = checkedMatrixCells(rows, cols);
 
   if (values.length !== cells) {
     throw new Error(
-      `Expected exactly ${cells} f64 values for a ${rows}x${cols} matrix, got ${values.length}`,
+      `Expected exactly ${cells} f64 values for ${matrices} matrices of shape ${rows}x${cols}, got ${values.length}`,
     );
   }
 
-  if (columnSums.length !== cols) {
-    throw new Error(`Expected exactly ${cols} column sums, got ${columnSums.length}`);
+  if (averageColumnSums.length !== cols) {
+    throw new Error(
+      `Expected exactly ${cols} averaged column sums, got ${averageColumnSums.length}`,
+    );
   }
 
-  columnSums.fill(0);
+  averageColumnSums.fill(0);
+  const matrixColumnSums = new Float64Array(cols);
+  let grandTotal = 0;
 
-  for (let row = 0; row < rows; row += 1) {
-    const rowStart = row * cols;
+  for (let matrix = 0; matrix < matrices; matrix += 1) {
+    matrixColumnSums.fill(0);
+    const matrixOffset = matrix * cellsPerMatrix;
+
+    for (let row = 0; row < rows; row += 1) {
+      const rowStart = matrixOffset + row * cols;
+
+      for (let col = 0; col < cols; col += 1) {
+        matrixColumnSums[col] += values[rowStart + col];
+      }
+    }
+
+    let matrixTotal = 0;
 
     for (let col = 0; col < cols; col += 1) {
-      columnSums[col] += values[rowStart + col];
+      averageColumnSums[col] += matrixColumnSums[col];
+      matrixTotal += matrixColumnSums[col];
     }
-  }
 
-  let total = 0;
+    grandTotal += matrixTotal;
+  }
 
   for (let col = 0; col < cols; col += 1) {
-    total += columnSums[col];
+    averageColumnSums[col] /= matrices;
   }
 
-  return total;
+  return grandTotal;
 }
 
-export function aggregateColumnsAndTotal(
+export function aggregateMatricesAverageColumnsAndGrandTotal(
   values: Float64Array,
+  matrices: number,
   rows: number,
   cols: number,
-): ColumnAggregation {
-  const columnSums = new Float64Array(cols);
-  const total = aggregateColumnsAndTotalInto(values, rows, cols, columnSums);
+): MatrixBatchAggregation {
+  const averageColumnSums = new Float64Array(cols);
+  const grandTotal = aggregateMatricesAverageColumnsAndGrandTotalInto(
+    values,
+    matrices,
+    rows,
+    cols,
+    averageColumnSums,
+  );
 
-  return { columnSums, total };
+  return { averageColumnSums, grandTotal };
 }

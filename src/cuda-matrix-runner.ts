@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 export type CudaMatrixBenchmarkOptions = {
+  matrices: number;
   rows: number;
   cols: number;
   warmup: number;
@@ -17,8 +18,8 @@ export type CudaMatrixBenchmarkResult = {
   minMs: number;
   maxMs: number;
   gibPerSecond: number;
-  total: number;
-  columnPreview: number[];
+  grandTotal: number;
+  averageColumnPreview: number[];
 };
 
 export function tryRunCudaMatrixBenchmark(
@@ -47,6 +48,8 @@ export function tryRunCudaMatrixBenchmark(
     const output = execFileSync(
       runnerPath,
       [
+        '--matrices',
+        String(options.matrices),
         '--rows',
         String(options.rows),
         '--cols',

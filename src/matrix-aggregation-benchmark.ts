@@ -1,15 +1,16 @@
 import {
-  aggregateColumnsAndTotalInto,
-  aggregateSharedF64MatrixColumnsInRust,
+  aggregateMatricesAverageColumnsAndGrandTotalInto,
+  aggregateSharedF64MatricesInRust,
   asF64View,
+  checkedMatrixBatchCells,
   compileMatrixReductionGpuPipeline,
   createSharedF64Buffer,
-  fillF64Matrix,
-  checkedMatrixCells,
+  fillF64Matrices,
 } from './index';
 import { tryRunCudaMatrixBenchmark } from './cuda-matrix-runner';
 
 type BenchmarkOptions = {
+  matrices: number;
   rows: number;
   cols: number;
   warmup: number;
@@ -19,12 +20,12 @@ type BenchmarkOptions = {
 type BenchmarkTask = {
   name: string;
   run: () => number;
-  readColumnSums: () => Float64Array;
+  readAverageColumnSums: () => Float64Array;
 };
 
 type BenchmarkResult = {
   name: string;
-  total: number;
+  grandTotal: number;
   averageMs: number;
   medianMs: number;
   minMs: number;
@@ -32,6 +33,7 @@ type BenchmarkResult = {
   gibPerSecond: number;
 };
 
+const DEFAULT_MATRICES = 4;
 const DEFAULT_ROWS = 1_000;
 const DEFAULT_COLS = 1_000;
 const DEFAULT_WARMUP = 3;
@@ -40,67 +42,82 @@ const PREVIEW_COLUMNS = 5;
 
 function main(): void {
   const options = parseArgs(process.argv.slice(2));
-  const cells = checkedMatrixCells(options.rows, options.cols);
+  const cells = checkedMatrixBatchCells(options.matrices, options.rows, options.cols);
   const matrixBytes = cells * Float64Array.BYTES_PER_ELEMENT;
-  const columnBytes = options.cols * Float64Array.BYTES_PER_ELEMENT;
-  const touchedBytes = matrixBytes + (2 * columnBytes);
+  const averageColumnBytes = options.cols * Float64Array.BYTES_PER_ELEMENT;
+  const touchedBytes = matrixBytes + averageColumnBytes + Float64Array.BYTES_PER_ELEMENT;
 
-  const matrixBuffer = createSharedF64Buffer(cells);
-  const matrix = asF64View(matrixBuffer, cells);
-  fillF64Matrix(matrix, options.rows, options.cols);
+  const matricesBuffer = createSharedF64Buffer(cells);
+  const matrices = asF64View(matricesBuffer, cells);
+  fillF64Matrices(matrices, options.matrices, options.rows, options.cols);
 
-  const jsColumnSums = new Float64Array(options.cols);
-  const rustColumnSumsBuffer = createSharedF64Buffer(options.cols);
-  const rustColumnSums = asF64View(rustColumnSumsBuffer, options.cols);
+  const jsAverageColumnSums = new Float64Array(options.cols);
+  const rustAverageColumnSumsBuffer = createSharedF64Buffer(options.cols);
+  const rustAverageColumnSums = asF64View(rustAverageColumnSumsBuffer, options.cols);
 
-  const referenceTotal = aggregateColumnsAndTotalInto(
-    matrix,
+  const referenceGrandTotal = aggregateMatricesAverageColumnsAndGrandTotalInto(
+    matrices,
+    options.matrices,
     options.rows,
     options.cols,
-    jsColumnSums,
+    jsAverageColumnSums,
   );
-  const referenceColumnSums = Float64Array.from(jsColumnSums);
+  const referenceAverageColumnSums = Float64Array.from(jsAverageColumnSums);
 
-  const rustTotal = aggregateSharedF64MatrixColumnsInRust(
-    matrixBuffer,
+  const rustGrandTotal = aggregateSharedF64MatricesInRust(
+    matricesBuffer,
+    options.matrices,
     options.rows,
     options.cols,
-    rustColumnSumsBuffer,
+    rustAverageColumnSumsBuffer,
   );
 
-  assertSameResults(referenceTotal, referenceColumnSums, rustTotal, rustColumnSums, 'rust / napi');
+  assertSameResults(
+    referenceGrandTotal,
+    referenceAverageColumnSums,
+    rustGrandTotal,
+    rustAverageColumnSums,
+    'rust / napi',
+  );
 
   const tasks: BenchmarkTask[] = [
     {
-      name: 'js / float64 column aggregation',
+      name: 'js / f64 batch aggregation',
       run: () =>
-        aggregateColumnsAndTotalInto(matrix, options.rows, options.cols, jsColumnSums),
-      readColumnSums: () => jsColumnSums,
-    },
-    {
-      name: 'rust / napi column aggregation',
-      run: () =>
-        aggregateSharedF64MatrixColumnsInRust(
-          matrixBuffer,
+        aggregateMatricesAverageColumnsAndGrandTotalInto(
+          matrices,
+          options.matrices,
           options.rows,
           options.cols,
-          rustColumnSumsBuffer,
+          jsAverageColumnSums,
         ),
-      readColumnSums: () => rustColumnSums,
+      readAverageColumnSums: () => jsAverageColumnSums,
+    },
+    {
+      name: 'rust / napi batch aggregation',
+      run: () =>
+        aggregateSharedF64MatricesInRust(
+          matricesBuffer,
+          options.matrices,
+          options.rows,
+          options.cols,
+          rustAverageColumnSumsBuffer,
+        ),
+      readAverageColumnSums: () => rustAverageColumnSums,
     },
   ];
 
   console.log(
     [
-      `Benchmarking ${options.rows}x${options.cols} float64 matrix aggregation`,
-      `${cells.toLocaleString()} cells`,
-      `${formatMiB(matrixBytes)} matrix`,
+      `Benchmarking ${options.matrices} matrices of shape ${options.rows}x${options.cols}`,
+      `${cells.toLocaleString()} f64 cells`,
+      `${formatMiB(matrixBytes)} batch`,
       `warmup=${options.warmup}`,
       `samples=${options.samples}`,
     ].join('  '),
   );
   console.log(
-    `Each run computes ${options.cols.toLocaleString()} column sums and then a total from those sums.`,
+    `Each run computes per-matrix column sums, averages those columns across ${options.matrices} matrices, and accumulates a grand total from the per-matrix totals.`,
   );
   console.log(
     'If CUDA is available, the benchmark also runs the GPU implementation; otherwise it logs an error and continues.',
@@ -108,10 +125,11 @@ function main(): void {
   console.log('');
 
   const results = tasks.map((task) =>
-    runTask(task, options, touchedBytes, referenceTotal, referenceColumnSums),
+    runTask(task, options, touchedBytes, referenceGrandTotal, referenceAverageColumnSums),
   );
 
   const gpuResult = tryRunCudaMatrixBenchmark({
+    matrices: options.matrices,
     rows: options.rows,
     cols: options.cols,
     warmup: options.warmup,
@@ -119,22 +137,24 @@ function main(): void {
   });
 
   if (gpuResult) {
-    if (gpuResult.total !== referenceTotal) {
-      throw new Error(`gpu total mismatch: ${gpuResult.total} !== ${referenceTotal}`);
+    if (gpuResult.grandTotal !== referenceGrandTotal) {
+      throw new Error(
+        `gpu grand total mismatch: ${gpuResult.grandTotal} !== ${referenceGrandTotal}`,
+      );
     }
 
-    const preview = referenceColumnSums.slice(0, gpuResult.columnPreview.length);
-    for (let index = 0; index < gpuResult.columnPreview.length; index += 1) {
-      if (gpuResult.columnPreview[index] !== preview[index]) {
+    const preview = referenceAverageColumnSums.slice(0, gpuResult.averageColumnPreview.length);
+    for (let index = 0; index < gpuResult.averageColumnPreview.length; index += 1) {
+      if (gpuResult.averageColumnPreview[index] !== preview[index]) {
         throw new Error(
-          `gpu preview mismatch at column ${index}: ${gpuResult.columnPreview[index]} !== ${preview[index]}`,
+          `gpu average-column preview mismatch at column ${index}: ${gpuResult.averageColumnPreview[index]} !== ${preview[index]}`,
         );
       }
     }
 
     results.push({
       name: gpuResult.name,
-      total: gpuResult.total,
+      grandTotal: gpuResult.grandTotal,
       averageMs: gpuResult.averageMs,
       medianMs: gpuResult.medianMs,
       minMs: gpuResult.minMs,
@@ -145,17 +165,23 @@ function main(): void {
 
   printResults(results);
 
-  const gpuPipeline = compileMatrixReductionGpuPipeline(options.rows, options.cols);
+  const gpuPipeline = compileMatrixReductionGpuPipeline(
+    options.matrices,
+    options.rows,
+    options.cols,
+  );
   console.log('');
   if (gpuResult) {
     console.log(`GPU device: ${gpuResult.deviceName}`);
   }
   console.log(`GPU lowering artifact: ${gpuPipeline.stage1KernelIr.split('\n', 1)[0]}`);
   console.log(`GPU lowering artifact: ${gpuPipeline.stage2KernelIr.split('\n', 1)[0]}`);
+  console.log(`GPU lowering artifact: ${gpuPipeline.stage3KernelIr.split('\n', 1)[0]}`);
+  console.log(`GPU lowering artifact: ${gpuPipeline.stage4KernelIr.split('\n', 1)[0]}`);
   console.log(`GPU PTX size: ${gpuPipeline.ptx.length.toLocaleString()} chars`);
-  console.log(`Reference total: ${referenceTotal.toFixed(3)}`);
+  console.log(`Reference grand total: ${referenceGrandTotal.toFixed(3)}`);
   console.log(
-    `Reference columns: ${Array.from(referenceColumnSums.slice(0, PREVIEW_COLUMNS))
+    `Reference averaged columns: ${Array.from(referenceAverageColumnSums.slice(0, PREVIEW_COLUMNS))
       .map((value) => value.toFixed(3))
       .join(', ')}`,
   );
@@ -165,28 +191,28 @@ function runTask(
   task: BenchmarkTask,
   options: BenchmarkOptions,
   touchedBytes: number,
-  referenceTotal: number,
-  referenceColumnSums: Float64Array,
+  referenceGrandTotal: number,
+  referenceAverageColumnSums: Float64Array,
 ): BenchmarkResult {
   for (let iteration = 0; iteration < options.warmup; iteration += 1) {
     task.run();
   }
 
   const samples: number[] = [];
-  let total = 0;
+  let grandTotal = 0;
 
   for (let iteration = 0; iteration < options.samples; iteration += 1) {
     const startedAt = process.hrtime.bigint();
-    total = task.run();
+    grandTotal = task.run();
     const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
     samples.push(elapsedMs);
   }
 
   assertSameResults(
-    referenceTotal,
-    referenceColumnSums,
-    total,
-    task.readColumnSums(),
+    referenceGrandTotal,
+    referenceAverageColumnSums,
+    grandTotal,
+    task.readAverageColumnSums(),
     task.name,
   );
 
@@ -199,7 +225,7 @@ function runTask(
 
   return {
     name: task.name,
-    total,
+    grandTotal,
     averageMs,
     medianMs,
     minMs,
@@ -209,26 +235,26 @@ function runTask(
 }
 
 function assertSameResults(
-  expectedTotal: number,
-  expectedColumnSums: Float64Array,
-  actualTotal: number,
-  actualColumnSums: Float64Array,
+  expectedGrandTotal: number,
+  expectedAverageColumnSums: Float64Array,
+  actualGrandTotal: number,
+  actualAverageColumnSums: Float64Array,
   label: string,
 ): void {
-  if (actualTotal !== expectedTotal) {
-    throw new Error(`${label} total mismatch: ${actualTotal} !== ${expectedTotal}`);
+  if (actualGrandTotal !== expectedGrandTotal) {
+    throw new Error(`${label} grand total mismatch: ${actualGrandTotal} !== ${expectedGrandTotal}`);
   }
 
-  if (actualColumnSums.length !== expectedColumnSums.length) {
+  if (actualAverageColumnSums.length !== expectedAverageColumnSums.length) {
     throw new Error(
-      `${label} column count mismatch: ${actualColumnSums.length} !== ${expectedColumnSums.length}`,
+      `${label} average-column count mismatch: ${actualAverageColumnSums.length} !== ${expectedAverageColumnSums.length}`,
     );
   }
 
-  for (let index = 0; index < expectedColumnSums.length; index += 1) {
-    if (actualColumnSums[index] !== expectedColumnSums[index]) {
+  for (let index = 0; index < expectedAverageColumnSums.length; index += 1) {
+    if (actualAverageColumnSums[index] !== expectedAverageColumnSums[index]) {
       throw new Error(
-        `${label} column ${index} mismatch: ${actualColumnSums[index]} !== ${expectedColumnSums[index]}`,
+        `${label} average column ${index} mismatch: ${actualAverageColumnSums[index]} !== ${expectedAverageColumnSums[index]}`,
       );
     }
   }
@@ -241,7 +267,7 @@ function printResults(results: BenchmarkResult[]): void {
     const relative = result.averageMs / fastestAverage;
     console.log(
       [
-        result.name.padEnd(34),
+        result.name.padEnd(36),
         `avg ${result.averageMs.toFixed(3).padStart(9)} ms`,
         `med ${result.medianMs.toFixed(3).padStart(9)} ms`,
         `min ${result.minMs.toFixed(3).padStart(9)} ms`,
@@ -259,6 +285,7 @@ function formatMiB(bytes: number): string {
 
 function parseArgs(argv: string[]): BenchmarkOptions {
   const options: BenchmarkOptions = {
+    matrices: DEFAULT_MATRICES,
     rows: DEFAULT_ROWS,
     cols: DEFAULT_COLS,
     warmup: DEFAULT_WARMUP,
@@ -270,6 +297,10 @@ function parseArgs(argv: string[]): BenchmarkOptions {
     const next = argv[index + 1];
 
     switch (arg) {
+      case '--matrices':
+        options.matrices = parsePositiveInt(arg, next);
+        index += 1;
+        break;
       case '--rows':
         options.rows = parsePositiveInt(arg, next);
         index += 1;
@@ -291,7 +322,7 @@ function parseArgs(argv: string[]): BenchmarkOptions {
     }
   }
 
-  checkedMatrixCells(options.rows, options.cols);
+  checkedMatrixBatchCells(options.matrices, options.rows, options.cols);
 
   return options;
 }

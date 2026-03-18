@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -16,6 +15,7 @@
 
 namespace {
 
+constexpr unsigned int kDefaultMatrices = 4;
 constexpr unsigned int kDefaultRows = 1000;
 constexpr unsigned int kDefaultCols = 1000;
 constexpr unsigned int kDefaultWarmup = 3;
@@ -23,6 +23,7 @@ constexpr unsigned int kDefaultSamples = 10;
 constexpr std::size_t kPreviewColumns = 5;
 
 struct Options {
+  unsigned int matrices = kDefaultMatrices;
   unsigned int rows = kDefaultRows;
   unsigned int cols = kDefaultCols;
   unsigned int warmup = kDefaultWarmup;
@@ -46,37 +47,78 @@ void check_cuda(cudaError_t status, const char* expr) {
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr)
 
-double matrix_value(std::size_t row, std::size_t col) {
-  return (static_cast<double>(row) * 0.5) +
+double matrix_value(std::size_t matrix, std::size_t row, std::size_t col) {
+  return (static_cast<double>(matrix) * 0.75) +
+         (static_cast<double>(row) * 0.5) +
          (static_cast<double>(col) * 0.25) +
-         (static_cast<double>((row ^ col) & 7U) * 0.125);
+         (static_cast<double>((matrix ^ row ^ col) & 7U) * 0.125);
 }
 
-void fill_matrix(std::vector<double>& values, unsigned int rows, unsigned int cols) {
-  for (unsigned int row = 0; row < rows; row += 1) {
-    const std::size_t row_start = static_cast<std::size_t>(row) * cols;
+std::size_t checked_cells_per_matrix(unsigned int rows, unsigned int cols) {
+  return static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+}
 
-    for (unsigned int col = 0; col < cols; col += 1) {
-      values[row_start + col] = matrix_value(row, col);
+std::size_t checked_batch_cells(unsigned int matrices, unsigned int rows, unsigned int cols) {
+  return static_cast<std::size_t>(matrices) * checked_cells_per_matrix(rows, cols);
+}
+
+void fill_matrices(std::vector<double>& values,
+                   unsigned int matrices,
+                   unsigned int rows,
+                   unsigned int cols) {
+  const std::size_t cells_per_matrix = checked_cells_per_matrix(rows, cols);
+
+  for (unsigned int matrix = 0; matrix < matrices; matrix += 1) {
+    const std::size_t matrix_offset = static_cast<std::size_t>(matrix) * cells_per_matrix;
+
+    for (unsigned int row = 0; row < rows; row += 1) {
+      const std::size_t row_start = matrix_offset + (static_cast<std::size_t>(row) * cols);
+
+      for (unsigned int col = 0; col < cols; col += 1) {
+        values[row_start + col] = matrix_value(matrix, row, col);
+      }
     }
   }
 }
 
-double aggregate_columns_and_total(const std::vector<double>& values,
-                                   unsigned int rows,
-                                   unsigned int cols,
-                                   std::vector<double>& column_sums) {
-  std::fill(column_sums.begin(), column_sums.end(), 0.0);
+double aggregate_average_columns_and_grand_total(const std::vector<double>& values,
+                                                 unsigned int matrices,
+                                                 unsigned int rows,
+                                                 unsigned int cols,
+                                                 std::vector<double>& average_column_sums) {
+  average_column_sums.assign(cols, 0.0);
 
-  for (unsigned int row = 0; row < rows; row += 1) {
-    const std::size_t row_start = static_cast<std::size_t>(row) * cols;
+  const std::size_t cells_per_matrix = checked_cells_per_matrix(rows, cols);
+  std::vector<double> matrix_column_sums(cols, 0.0);
+  double grand_total = 0.0;
 
-    for (unsigned int col = 0; col < cols; col += 1) {
-      column_sums[col] += values[row_start + col];
+  for (unsigned int matrix = 0; matrix < matrices; matrix += 1) {
+    std::fill(matrix_column_sums.begin(), matrix_column_sums.end(), 0.0);
+    const std::size_t matrix_offset = static_cast<std::size_t>(matrix) * cells_per_matrix;
+
+    for (unsigned int row = 0; row < rows; row += 1) {
+      const std::size_t row_start = matrix_offset + (static_cast<std::size_t>(row) * cols);
+
+      for (unsigned int col = 0; col < cols; col += 1) {
+        matrix_column_sums[col] += values[row_start + col];
+      }
     }
+
+    double matrix_total = 0.0;
+    for (unsigned int col = 0; col < cols; col += 1) {
+      average_column_sums[col] += matrix_column_sums[col];
+      matrix_total += matrix_column_sums[col];
+    }
+
+    grand_total += matrix_total;
   }
 
-  return std::accumulate(column_sums.begin(), column_sums.end(), 0.0);
+  const double divisor = static_cast<double>(matrices);
+  for (double& value : average_column_sums) {
+    value /= divisor;
+  }
+
+  return grand_total;
 }
 
 Stats compute_stats(const std::vector<double>& samples_ms) {
@@ -117,7 +159,9 @@ Options parse_args(int argc, char** argv) {
       return static_cast<unsigned int>(parsed);
     };
 
-    if (arg == "--rows") {
+    if (arg == "--matrices") {
+      options.matrices = read_value("--matrices", false);
+    } else if (arg == "--rows") {
       options.rows = read_value("--rows", false);
     } else if (arg == "--cols") {
       options.cols = read_value("--cols", false);
@@ -173,34 +217,75 @@ std::string format_preview(const std::vector<double>& values) {
   return preview.str();
 }
 
-__global__ void matrix_column_sum_f64(const double* matrix,
-                                      double* column_sums,
+__global__ void matrix_column_sum_f64(const double* matrices,
+                                      double* matrix_column_sums,
+                                      unsigned int matrix_count,
                                       unsigned int rows,
                                       unsigned int cols) {
+  const unsigned int linear = (blockIdx.x * blockDim.x) + threadIdx.x;
+  const unsigned int total_columns = matrix_count * cols;
+
+  if (linear < total_columns) {
+    const unsigned int matrix = linear / cols;
+    const unsigned int col = linear % cols;
+    const std::size_t cells_per_matrix = static_cast<std::size_t>(rows) * cols;
+    const std::size_t matrix_offset = static_cast<std::size_t>(matrix) * cells_per_matrix;
+    double acc = 0.0;
+
+    for (unsigned int row = 0; row < rows; row += 1) {
+      acc += matrices[matrix_offset + (static_cast<std::size_t>(row) * cols) + col];
+    }
+
+    matrix_column_sums[linear] = acc;
+  }
+}
+
+__global__ void average_columns_f64(const double* matrix_column_sums,
+                                    double* average_column_sums,
+                                    unsigned int matrix_count,
+                                    unsigned int cols) {
   const unsigned int col = (blockIdx.x * blockDim.x) + threadIdx.x;
 
   if (col < cols) {
     double acc = 0.0;
 
-    for (unsigned int row = 0; row < rows; row += 1) {
-      acc += matrix[(static_cast<std::size_t>(row) * cols) + col];
+    for (unsigned int matrix = 0; matrix < matrix_count; matrix += 1) {
+      acc += matrix_column_sums[(static_cast<std::size_t>(matrix) * cols) + col];
     }
 
-    column_sums[col] = acc;
+    average_column_sums[col] = acc / static_cast<double>(matrix_count);
   }
 }
 
-__global__ void matrix_total_sum_f64(const double* column_sums,
-                                     double* total,
-                                     unsigned int cols) {
+__global__ void matrix_totals_f64(const double* matrix_column_sums,
+                                  double* matrix_totals,
+                                  unsigned int matrix_count,
+                                  unsigned int cols) {
+  const unsigned int matrix = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+  if (matrix < matrix_count) {
+    double acc = 0.0;
+    const std::size_t row_offset = static_cast<std::size_t>(matrix) * cols;
+
+    for (unsigned int col = 0; col < cols; col += 1) {
+      acc += matrix_column_sums[row_offset + col];
+    }
+
+    matrix_totals[matrix] = acc;
+  }
+}
+
+__global__ void grand_total_f64(const double* matrix_totals,
+                                double* grand_total,
+                                unsigned int matrix_count) {
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     double acc = 0.0;
 
-    for (unsigned int col = 0; col < cols; col += 1) {
-      acc += column_sums[col];
+    for (unsigned int matrix = 0; matrix < matrix_count; matrix += 1) {
+      acc += matrix_totals[matrix];
     }
 
-    total[0] = acc;
+    grand_total[0] = acc;
   }
 }
 
@@ -222,47 +307,93 @@ int main(int argc, char** argv) {
     cudaDeviceProp device{};
     CHECK_CUDA(cudaGetDeviceProperties(&device, 0));
 
-    const std::size_t cells = static_cast<std::size_t>(options.rows) * options.cols;
+    const std::size_t cells = checked_batch_cells(options.matrices, options.rows, options.cols);
+    const std::size_t cells_per_matrix = checked_cells_per_matrix(options.rows, options.cols);
     const std::size_t matrix_bytes = cells * sizeof(double);
-    const std::size_t column_bytes = static_cast<std::size_t>(options.cols) * sizeof(double);
+    const std::size_t matrix_column_sum_bytes =
+        static_cast<std::size_t>(options.matrices) * options.cols * sizeof(double);
+    const std::size_t average_column_bytes =
+        static_cast<std::size_t>(options.cols) * sizeof(double);
+    const std::size_t matrix_total_bytes =
+        static_cast<std::size_t>(options.matrices) * sizeof(double);
 
-    std::vector<double> host_matrix(cells);
-    std::vector<double> reference_column_sums(options.cols);
-    std::vector<double> gpu_column_sums(options.cols);
-    double gpu_total = 0.0;
+    std::vector<double> host_matrices(cells);
+    std::vector<double> reference_average_column_sums(options.cols);
+    std::vector<double> gpu_average_column_sums(options.cols);
+    double gpu_grand_total = 0.0;
 
-    fill_matrix(host_matrix, options.rows, options.cols);
-    const double reference_total = aggregate_columns_and_total(
-        host_matrix, options.rows, options.cols, reference_column_sums);
+    fill_matrices(host_matrices, options.matrices, options.rows, options.cols);
+    const double reference_grand_total = aggregate_average_columns_and_grand_total(
+        host_matrices,
+        options.matrices,
+        options.rows,
+        options.cols,
+        reference_average_column_sums);
 
-    double* device_matrix = nullptr;
-    double* device_column_sums = nullptr;
-    double* device_total = nullptr;
-    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_matrix), matrix_bytes));
-    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_column_sums), column_bytes));
-    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_total), sizeof(double)));
+    double* device_matrices = nullptr;
+    double* device_matrix_column_sums = nullptr;
+    double* device_average_column_sums = nullptr;
+    double* device_matrix_totals = nullptr;
+    double* device_grand_total = nullptr;
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_matrices), matrix_bytes));
+    CHECK_CUDA(
+        cudaMalloc(reinterpret_cast<void**>(&device_matrix_column_sums), matrix_column_sum_bytes));
+    CHECK_CUDA(
+        cudaMalloc(reinterpret_cast<void**>(&device_average_column_sums), average_column_bytes));
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_matrix_totals), matrix_total_bytes));
+    CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_grand_total), sizeof(double)));
 
     const dim3 block(256);
-    const dim3 grid((options.cols + block.x - 1) / block.x);
+    const dim3 column_sum_grid(
+        static_cast<unsigned int>((static_cast<std::size_t>(options.matrices) * options.cols +
+                                   block.x - 1) /
+                                  block.x));
+    const dim3 average_columns_grid((options.cols + block.x - 1) / block.x);
+    const dim3 matrix_totals_grid((options.matrices + block.x - 1) / block.x);
 
     auto run_once = [&]() -> double {
       const auto started_at = std::chrono::steady_clock::now();
 
       CHECK_CUDA(cudaMemcpy(
-          device_matrix, host_matrix.data(), matrix_bytes, cudaMemcpyHostToDevice));
+          device_matrices, host_matrices.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
-      matrix_column_sum_f64<<<grid, block>>>(
-          device_matrix, device_column_sums, options.rows, options.cols);
+      matrix_column_sum_f64<<<column_sum_grid, block>>>(
+          device_matrices,
+          device_matrix_column_sums,
+          options.matrices,
+          options.rows,
+          options.cols);
       CHECK_CUDA(cudaGetLastError());
 
-      matrix_total_sum_f64<<<1, 1>>>(device_column_sums, device_total, options.cols);
+      average_columns_f64<<<average_columns_grid, block>>>(
+          device_matrix_column_sums,
+          device_average_column_sums,
+          options.matrices,
+          options.cols);
+      CHECK_CUDA(cudaGetLastError());
+
+      matrix_totals_f64<<<matrix_totals_grid, block>>>(
+          device_matrix_column_sums,
+          device_matrix_totals,
+          options.matrices,
+          options.cols);
+      CHECK_CUDA(cudaGetLastError());
+
+      grand_total_f64<<<1, 1>>>(
+          device_matrix_totals, device_grand_total, options.matrices);
       CHECK_CUDA(cudaGetLastError());
 
       CHECK_CUDA(cudaDeviceSynchronize());
       CHECK_CUDA(cudaMemcpy(
-          gpu_column_sums.data(), device_column_sums, column_bytes, cudaMemcpyDeviceToHost));
-      CHECK_CUDA(
-          cudaMemcpy(&gpu_total, device_total, sizeof(double), cudaMemcpyDeviceToHost));
+          gpu_average_column_sums.data(),
+          device_average_column_sums,
+          average_column_bytes,
+          cudaMemcpyDeviceToHost));
+      CHECK_CUDA(cudaMemcpy(
+          &gpu_grand_total,
+          device_grand_total,
+          sizeof(double),
+          cudaMemcpyDeviceToHost));
 
       const auto finished_at = std::chrono::steady_clock::now();
       return std::chrono::duration<double, std::milli>(finished_at - started_at).count();
@@ -279,38 +410,41 @@ int main(int argc, char** argv) {
     for (unsigned int iteration = 0; iteration < options.samples; iteration += 1) {
       samples_ms.push_back(run_once());
 
-      if (gpu_total != reference_total) {
-        std::cerr << "GPU total mismatch: " << gpu_total << " != " << reference_total
-                  << std::endl;
+      if (gpu_grand_total != reference_grand_total) {
+        std::cerr << "GPU grand total mismatch: " << gpu_grand_total << " != "
+                  << reference_grand_total << std::endl;
         return 3;
       }
 
-      if (gpu_column_sums != reference_column_sums) {
-        std::cerr << "GPU column sums mismatch" << std::endl;
+      if (gpu_average_column_sums != reference_average_column_sums) {
+        std::cerr << "GPU averaged column sums mismatch" << std::endl;
         return 4;
       }
     }
 
     const Stats stats = compute_stats(samples_ms);
-    const double touched_bytes = static_cast<double>(matrix_bytes + (2 * column_bytes));
+    const double touched_bytes = static_cast<double>(matrix_bytes + average_column_bytes +
+                                                     sizeof(double));
     const double gib_per_second =
         touched_bytes / (1024.0 * 1024.0 * 1024.0) / (stats.average_ms / 1000.0);
 
     std::cout << "{";
-    std::cout << "\"name\":\"gpu / cuda runtime (h2d + d2h)\",";
+    std::cout << "\"name\":\"gpu / cuda batch aggregation (h2d + d2h)\",";
     std::cout << "\"deviceName\":\"" << escape_json(device.name) << "\",";
     std::cout << "\"averageMs\":" << std::setprecision(17) << stats.average_ms << ",";
     std::cout << "\"medianMs\":" << std::setprecision(17) << stats.median_ms << ",";
     std::cout << "\"minMs\":" << std::setprecision(17) << stats.min_ms << ",";
     std::cout << "\"maxMs\":" << std::setprecision(17) << stats.max_ms << ",";
     std::cout << "\"gibPerSecond\":" << std::setprecision(17) << gib_per_second << ",";
-    std::cout << "\"total\":" << std::setprecision(17) << gpu_total << ",";
-    std::cout << "\"columnPreview\":" << format_preview(gpu_column_sums);
+    std::cout << "\"grandTotal\":" << std::setprecision(17) << gpu_grand_total << ",";
+    std::cout << "\"averageColumnPreview\":" << format_preview(gpu_average_column_sums);
     std::cout << "}" << std::endl;
 
-    CHECK_CUDA(cudaFree(device_total));
-    CHECK_CUDA(cudaFree(device_column_sums));
-    CHECK_CUDA(cudaFree(device_matrix));
+    CHECK_CUDA(cudaFree(device_grand_total));
+    CHECK_CUDA(cudaFree(device_matrix_totals));
+    CHECK_CUDA(cudaFree(device_average_column_sums));
+    CHECK_CUDA(cudaFree(device_matrix_column_sums));
+    CHECK_CUDA(cudaFree(device_matrices));
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << std::endl;
