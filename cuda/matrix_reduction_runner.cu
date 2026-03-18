@@ -20,6 +20,7 @@ constexpr unsigned int kDefaultRows = 1000;
 constexpr unsigned int kDefaultCols = 1000;
 constexpr unsigned int kDefaultWarmup = 3;
 constexpr unsigned int kDefaultSamples = 10;
+constexpr unsigned int kReductionBlockSize = 256;
 constexpr std::size_t kPreviewColumns = 5;
 
 struct Options {
@@ -217,12 +218,27 @@ std::string format_preview(const std::vector<double>& values) {
   return preview.str();
 }
 
+__device__ double block_reduce_sum(double partial, double* partials) {
+  partials[threadIdx.x] = partial;
+  __syncthreads();
+
+  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      partials[threadIdx.x] += partials[threadIdx.x + stride];
+    }
+
+    __syncthreads();
+  }
+
+  return partials[0];
+}
+
 __global__ void matrix_column_sum_f64(const double* matrices,
                                       double* matrix_column_sums,
                                       unsigned int matrix_count,
                                       unsigned int rows,
                                       unsigned int cols) {
-  const unsigned int linear = (blockIdx.x * blockDim.x) + threadIdx.x;
+  const unsigned int linear = blockIdx.x;
   const unsigned int total_columns = matrix_count * cols;
 
   if (linear < total_columns) {
@@ -230,13 +246,17 @@ __global__ void matrix_column_sum_f64(const double* matrices,
     const unsigned int col = linear % cols;
     const std::size_t cells_per_matrix = static_cast<std::size_t>(rows) * cols;
     const std::size_t matrix_offset = static_cast<std::size_t>(matrix) * cells_per_matrix;
-    double acc = 0.0;
+    extern __shared__ double partials[];
+    double partial = 0.0;
 
-    for (unsigned int row = 0; row < rows; row += 1) {
-      acc += matrices[matrix_offset + (static_cast<std::size_t>(row) * cols) + col];
+    for (unsigned int row = threadIdx.x; row < rows; row += blockDim.x) {
+      partial += matrices[matrix_offset + (static_cast<std::size_t>(row) * cols) + col];
     }
 
-    matrix_column_sums[linear] = acc;
+    const double reduced = block_reduce_sum(partial, partials);
+    if (threadIdx.x == 0) {
+      matrix_column_sums[linear] = reduced;
+    }
   }
 }
 
@@ -244,16 +264,20 @@ __global__ void average_columns_f64(const double* matrix_column_sums,
                                     double* average_column_sums,
                                     unsigned int matrix_count,
                                     unsigned int cols) {
-  const unsigned int col = (blockIdx.x * blockDim.x) + threadIdx.x;
+  const unsigned int col = blockIdx.x;
 
   if (col < cols) {
-    double acc = 0.0;
+    extern __shared__ double partials[];
+    double partial = 0.0;
 
-    for (unsigned int matrix = 0; matrix < matrix_count; matrix += 1) {
-      acc += matrix_column_sums[(static_cast<std::size_t>(matrix) * cols) + col];
+    for (unsigned int matrix = threadIdx.x; matrix < matrix_count; matrix += blockDim.x) {
+      partial += matrix_column_sums[(static_cast<std::size_t>(matrix) * cols) + col];
     }
 
-    average_column_sums[col] = acc / static_cast<double>(matrix_count);
+    const double reduced = block_reduce_sum(partial, partials);
+    if (threadIdx.x == 0) {
+      average_column_sums[col] = reduced / static_cast<double>(matrix_count);
+    }
   }
 }
 
@@ -261,31 +285,37 @@ __global__ void matrix_totals_f64(const double* matrix_column_sums,
                                   double* matrix_totals,
                                   unsigned int matrix_count,
                                   unsigned int cols) {
-  const unsigned int matrix = (blockIdx.x * blockDim.x) + threadIdx.x;
+  const unsigned int matrix = blockIdx.x;
 
   if (matrix < matrix_count) {
-    double acc = 0.0;
+    extern __shared__ double partials[];
+    double partial = 0.0;
     const std::size_t row_offset = static_cast<std::size_t>(matrix) * cols;
 
-    for (unsigned int col = 0; col < cols; col += 1) {
-      acc += matrix_column_sums[row_offset + col];
+    for (unsigned int col = threadIdx.x; col < cols; col += blockDim.x) {
+      partial += matrix_column_sums[row_offset + col];
     }
 
-    matrix_totals[matrix] = acc;
+    const double reduced = block_reduce_sum(partial, partials);
+    if (threadIdx.x == 0) {
+      matrix_totals[matrix] = reduced;
+    }
   }
 }
 
 __global__ void grand_total_f64(const double* matrix_totals,
                                 double* grand_total,
                                 unsigned int matrix_count) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    double acc = 0.0;
+  extern __shared__ double partials[];
+  double partial = 0.0;
 
-    for (unsigned int matrix = 0; matrix < matrix_count; matrix += 1) {
-      acc += matrix_totals[matrix];
-    }
+  for (unsigned int matrix = threadIdx.x; matrix < matrix_count; matrix += blockDim.x) {
+    partial += matrix_totals[matrix];
+  }
 
-    grand_total[0] = acc;
+  const double reduced = block_reduce_sum(partial, partials);
+  if (threadIdx.x == 0) {
+    grand_total[0] = reduced;
   }
 }
 
@@ -343,13 +373,12 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_matrix_totals), matrix_total_bytes));
     CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&device_grand_total), sizeof(double)));
 
-    const dim3 block(256);
-    const dim3 column_sum_grid(
-        static_cast<unsigned int>((static_cast<std::size_t>(options.matrices) * options.cols +
-                                   block.x - 1) /
-                                  block.x));
-    const dim3 average_columns_grid((options.cols + block.x - 1) / block.x);
-    const dim3 matrix_totals_grid((options.matrices + block.x - 1) / block.x);
+    const dim3 block(kReductionBlockSize);
+    const std::size_t reduction_shared_bytes = static_cast<std::size_t>(block.x) * sizeof(double);
+    const dim3 column_sum_grid(static_cast<unsigned int>(
+        static_cast<std::size_t>(options.matrices) * options.cols));
+    const dim3 average_columns_grid(options.cols);
+    const dim3 matrix_totals_grid(options.matrices);
 
     auto run_once = [&]() -> double {
       const auto started_at = std::chrono::steady_clock::now();
@@ -357,7 +386,7 @@ int main(int argc, char** argv) {
       CHECK_CUDA(cudaMemcpy(
           device_matrices, host_matrices.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
-      matrix_column_sum_f64<<<column_sum_grid, block>>>(
+      matrix_column_sum_f64<<<column_sum_grid, block, reduction_shared_bytes>>>(
           device_matrices,
           device_matrix_column_sums,
           options.matrices,
@@ -365,21 +394,21 @@ int main(int argc, char** argv) {
           options.cols);
       CHECK_CUDA(cudaGetLastError());
 
-      average_columns_f64<<<average_columns_grid, block>>>(
+      average_columns_f64<<<average_columns_grid, block, reduction_shared_bytes>>>(
           device_matrix_column_sums,
           device_average_column_sums,
           options.matrices,
           options.cols);
       CHECK_CUDA(cudaGetLastError());
 
-      matrix_totals_f64<<<matrix_totals_grid, block>>>(
+      matrix_totals_f64<<<matrix_totals_grid, block, reduction_shared_bytes>>>(
           device_matrix_column_sums,
           device_matrix_totals,
           options.matrices,
           options.cols);
       CHECK_CUDA(cudaGetLastError());
 
-      grand_total_f64<<<1, 1>>>(
+      grand_total_f64<<<1, block, reduction_shared_bytes>>>(
           device_matrix_totals, device_grand_total, options.matrices);
       CHECK_CUDA(cudaGetLastError());
 
