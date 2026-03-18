@@ -22,6 +22,7 @@ export type CudaMatrixBenchmarkResult = {
   maxMs: number;
   gibPerSecond: number;
   grandTotal: number;
+  hostToDeviceCopyAverageMs: number | null;
   averageColumnPreview: number[];
 };
 

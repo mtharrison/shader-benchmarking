@@ -207,6 +207,13 @@ function main(): void {
   console.log('');
   if (gpuResults && gpuResults.length > 0) {
     console.log(`GPU device: ${gpuResults[0].deviceName}`);
+    const e2eResult = gpuResults.find((result) => result.mode === 'e2e');
+    if (e2eResult && e2eResult.hostToDeviceCopyAverageMs !== null) {
+      const share = (e2eResult.hostToDeviceCopyAverageMs / e2eResult.averageMs) * 100;
+      console.log(
+        `GPU mean H2D copy time (per e2e sample): ${e2eResult.hostToDeviceCopyAverageMs.toFixed(3)} ms (${share.toFixed(2)}% of e2e avg)`,
+      );
+    }
   }
   console.log(`GPU lowering artifact: ${gpuPipeline.stage1KernelIr.split('\n', 1)[0]}`);
   console.log(`GPU lowering artifact: ${gpuPipeline.stage2KernelIr.split('\n', 1)[0]}`);

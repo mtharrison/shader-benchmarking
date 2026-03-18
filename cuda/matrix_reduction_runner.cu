@@ -38,6 +38,11 @@ struct Stats {
   double max_ms = 0.0;
 };
 
+struct E2ESampleStats {
+  double total_ms = 0.0;
+  double host_to_device_copy_ms = 0.0;
+};
+
 void check_cuda(cudaError_t status, const char* expr) {
   if (status != cudaSuccess) {
     throw std::runtime_error(
@@ -256,7 +261,8 @@ std::string format_result_json(const char* mode,
                                const Stats& stats,
                                double gib_per_second,
                                double grand_total,
-                               const std::vector<double>& average_column_sums) {
+                               const std::vector<double>& average_column_sums,
+                               double host_to_device_copy_average_ms = -1.0) {
   std::ostringstream output;
   output << "{";
   output << "\"mode\":\"" << escape_json(mode) << "\",";
@@ -268,6 +274,12 @@ std::string format_result_json(const char* mode,
   output << "\"maxMs\":" << std::setprecision(17) << stats.max_ms << ",";
   output << "\"gibPerSecond\":" << std::setprecision(17) << gib_per_second << ",";
   output << "\"grandTotal\":" << std::setprecision(17) << grand_total << ",";
+  if (host_to_device_copy_average_ms >= 0.0) {
+    output << "\"hostToDeviceCopyAverageMs\":" << std::setprecision(17)
+           << host_to_device_copy_average_ms << ",";
+  } else {
+    output << "\"hostToDeviceCopyAverageMs\":null,";
+  }
   output << "\"averageColumnPreview\":" << format_preview(average_column_sums);
   output << "}";
   return output.str();
@@ -435,11 +447,14 @@ int main(int argc, char** argv) {
       return std::chrono::duration<double, std::milli>(finished_at - started_at).count();
     };
 
-    auto run_once_e2e = [&]() -> double {
+    auto run_once_e2e = [&]() -> E2ESampleStats {
       const auto started_at = std::chrono::steady_clock::now();
+      const auto copy_started_at = std::chrono::steady_clock::now();
 
       CHECK_CUDA(
           cudaMemcpy(device_matrices, host_matrices.data(), matrix_bytes, cudaMemcpyHostToDevice));
+
+      const auto copy_finished_at = std::chrono::steady_clock::now();
 
       CHECK_CUBLAS(cublasDgemmStridedBatched(handle,
                                              CUBLAS_OP_N,
@@ -503,7 +518,10 @@ int main(int argc, char** argv) {
       CHECK_CUDA(cudaDeviceSynchronize());
 
       const auto finished_at = std::chrono::steady_clock::now();
-      return std::chrono::duration<double, std::milli>(finished_at - started_at).count();
+      return {
+          std::chrono::duration<double, std::milli>(finished_at - started_at).count(),
+          std::chrono::duration<double, std::milli>(copy_finished_at - copy_started_at).count(),
+      };
     };
 
     for (unsigned int iteration = 0; iteration < options.warmup; iteration += 1) {
@@ -537,15 +555,19 @@ int main(int argc, char** argv) {
     }
 
     for (unsigned int iteration = 0; iteration < options.warmup; iteration += 1) {
-      const double ignored = run_once_e2e();
+      const E2ESampleStats ignored = run_once_e2e();
       (void)ignored;
     }
 
     std::vector<double> e2e_samples_ms;
     e2e_samples_ms.reserve(options.samples);
+    std::vector<double> h2d_copy_samples_ms;
+    h2d_copy_samples_ms.reserve(options.samples);
 
     for (unsigned int iteration = 0; iteration < options.samples; iteration += 1) {
-      e2e_samples_ms.push_back(run_once_e2e());
+      const E2ESampleStats sample = run_once_e2e();
+      e2e_samples_ms.push_back(sample.total_ms);
+      h2d_copy_samples_ms.push_back(sample.host_to_device_copy_ms);
     }
 
     if (e2e_grand_total != reference_grand_total) {
@@ -561,6 +583,7 @@ int main(int argc, char** argv) {
 
     const Stats resident_stats = compute_stats(resident_samples_ms);
     const Stats e2e_stats = compute_stats(e2e_samples_ms);
+    const Stats h2d_copy_stats = compute_stats(h2d_copy_samples_ms);
     const double logical_touched_bytes =
         static_cast<double>(matrix_bytes + (3 * matrix_column_sum_bytes) +
                             average_column_bytes + (2 * matrix_total_bytes) + sizeof(double));
@@ -578,7 +601,8 @@ int main(int argc, char** argv) {
                                     e2e_stats,
                                     e2e_gib_per_second,
                                     e2e_grand_total,
-                                    e2e_average_column_sums);
+                                    e2e_average_column_sums,
+                                    h2d_copy_stats.average_ms);
     std::cout << ",";
     std::cout << format_result_json("resident",
                                     "gpu / cuda resident batch aggregation (cuBLAS)",
