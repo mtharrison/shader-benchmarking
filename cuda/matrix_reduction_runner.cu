@@ -43,6 +43,36 @@ struct E2ESampleStats {
   double host_to_device_copy_ms = 0.0;
 };
 
+void check_cuda(cudaError_t status, const char* expr);
+
+template <typename T>
+struct PinnedHostBuffer {
+  T* data = nullptr;
+  std::size_t count = 0;
+
+  explicit PinnedHostBuffer(std::size_t requested_count) : count(requested_count) {
+    if (count == 0) {
+      return;
+    }
+
+    void* raw = nullptr;
+    check_cuda(cudaMallocHost(&raw, count * sizeof(T)), "cudaMallocHost(&raw, count * sizeof(T))");
+    data = static_cast<T*>(raw);
+  }
+
+  ~PinnedHostBuffer() {
+    if (data != nullptr) {
+      cudaFreeHost(data);
+    }
+  }
+
+  PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+  PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+
+  T& operator[](std::size_t index) { return data[index]; }
+  const T& operator[](std::size_t index) const { return data[index]; }
+};
+
 void check_cuda(cudaError_t status, const char* expr) {
   if (status != cudaSuccess) {
     throw std::runtime_error(
@@ -317,13 +347,19 @@ int main(int argc, char** argv) {
     std::vector<double> host_ones_rows(options.rows, 1.0);
     std::vector<double> host_ones_cols(options.cols, 1.0);
     std::vector<double> host_ones_matrices(options.matrices, 1.0);
+    PinnedHostBuffer<double> pinned_host_matrices(cells);
+    PinnedHostBuffer<double> pinned_average_column_sums(options.cols);
+    PinnedHostBuffer<double> pinned_grand_total(1);
     std::vector<double> reference_average_column_sums(options.cols);
     std::vector<double> resident_average_column_sums(options.cols);
-    std::vector<double> e2e_average_column_sums(options.cols);
+    std::vector<double> pageable_e2e_average_column_sums(options.cols);
+    std::vector<double> pinned_e2e_average_column_sums(options.cols);
     double resident_grand_total = 0.0;
-    double e2e_grand_total = 0.0;
+    double pageable_e2e_grand_total = 0.0;
+    double pinned_e2e_grand_total = 0.0;
 
     fill_matrices(host_matrices, options.matrices, options.rows, options.cols);
+    std::copy(host_matrices.begin(), host_matrices.end(), pinned_host_matrices.data);
     const double reference_grand_total = aggregate_average_columns_and_grand_total(
         host_matrices,
         options.matrices,
@@ -385,9 +421,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(device_alpha_average, &alpha_average, sizeof(double), cudaMemcpyHostToDevice));
     CHECK_CUBLAS(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE));
 
-    auto run_once_resident = [&]() -> double {
-      const auto started_at = std::chrono::steady_clock::now();
-
+    auto run_reduction_pipeline = [&]() {
       CHECK_CUBLAS(cublasDgemmStridedBatched(handle,
                                              CUBLAS_OP_N,
                                              CUBLAS_OP_N,
@@ -440,6 +474,12 @@ int main(int argc, char** argv) {
                               device_ones_matrices,
                               1,
                               device_grand_total));
+    };
+
+    auto run_once_resident = [&]() -> double {
+      const auto started_at = std::chrono::steady_clock::now();
+
+      run_reduction_pipeline();
 
       CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -447,7 +487,7 @@ int main(int argc, char** argv) {
       return std::chrono::duration<double, std::milli>(finished_at - started_at).count();
     };
 
-    auto run_once_e2e = [&]() -> E2ESampleStats {
+    auto run_once_e2e_pageable = [&]() -> E2ESampleStats {
       const auto started_at = std::chrono::steady_clock::now();
       const auto copy_started_at = std::chrono::steady_clock::now();
 
@@ -456,65 +496,43 @@ int main(int argc, char** argv) {
 
       const auto copy_finished_at = std::chrono::steady_clock::now();
 
-      CHECK_CUBLAS(cublasDgemmStridedBatched(handle,
-                                             CUBLAS_OP_N,
-                                             CUBLAS_OP_N,
-                                             static_cast<int>(options.cols),
-                                             1,
-                                             static_cast<int>(options.rows),
-                                             device_alpha_one,
-                                             device_matrices,
-                                             static_cast<int>(options.cols),
-                                             static_cast<long long>(cells_per_matrix),
-                                             device_ones_rows,
-                                             static_cast<int>(options.rows),
-                                             0,
-                                             device_beta_zero,
-                                             device_matrix_column_sums,
-                                             static_cast<int>(options.cols),
-                                             static_cast<long long>(options.cols),
-                                             static_cast<int>(options.matrices)));
+      run_reduction_pipeline();
 
-      CHECK_CUBLAS(cublasDgemv(handle,
-                               CUBLAS_OP_N,
-                               static_cast<int>(options.cols),
-                               static_cast<int>(options.matrices),
-                               device_alpha_average,
-                               device_matrix_column_sums,
-                               static_cast<int>(options.cols),
-                               device_ones_matrices,
-                               1,
-                               device_beta_zero,
-                               device_average_column_sums,
-                               1));
-
-      CHECK_CUBLAS(cublasDgemv(handle,
-                               CUBLAS_OP_T,
-                               static_cast<int>(options.cols),
-                               static_cast<int>(options.matrices),
-                               device_alpha_one,
-                               device_matrix_column_sums,
-                               static_cast<int>(options.cols),
-                               device_ones_cols,
-                               1,
-                               device_beta_zero,
-                               device_matrix_totals,
-                               1));
-
-      CHECK_CUBLAS(cublasDdot(handle,
-                              static_cast<int>(options.matrices),
-                              device_matrix_totals,
-                              1,
-                              device_ones_matrices,
-                              1,
-                              device_grand_total));
-
-      CHECK_CUDA(cudaMemcpy(e2e_average_column_sums.data(),
+      CHECK_CUDA(cudaMemcpy(pageable_e2e_average_column_sums.data(),
                             device_average_column_sums,
                             average_column_bytes,
                             cudaMemcpyDeviceToHost));
       CHECK_CUDA(
-          cudaMemcpy(&e2e_grand_total, device_grand_total, sizeof(double), cudaMemcpyDeviceToHost));
+          cudaMemcpy(&pageable_e2e_grand_total,
+                     device_grand_total,
+                     sizeof(double),
+                     cudaMemcpyDeviceToHost));
+      CHECK_CUDA(cudaDeviceSynchronize());
+
+      const auto finished_at = std::chrono::steady_clock::now();
+      return {
+          std::chrono::duration<double, std::milli>(finished_at - started_at).count(),
+          std::chrono::duration<double, std::milli>(copy_finished_at - copy_started_at).count(),
+      };
+    };
+
+    auto run_once_e2e_pinned = [&]() -> E2ESampleStats {
+      const auto started_at = std::chrono::steady_clock::now();
+      const auto copy_started_at = std::chrono::steady_clock::now();
+
+      CHECK_CUDA(cudaMemcpy(
+          device_matrices, pinned_host_matrices.data, matrix_bytes, cudaMemcpyHostToDevice));
+
+      const auto copy_finished_at = std::chrono::steady_clock::now();
+
+      run_reduction_pipeline();
+
+      CHECK_CUDA(cudaMemcpy(pinned_average_column_sums.data,
+                            device_average_column_sums,
+                            average_column_bytes,
+                            cudaMemcpyDeviceToHost));
+      CHECK_CUDA(cudaMemcpy(
+          pinned_grand_total.data, device_grand_total, sizeof(double), cudaMemcpyDeviceToHost));
       CHECK_CUDA(cudaDeviceSynchronize());
 
       const auto finished_at = std::chrono::steady_clock::now();
@@ -555,35 +573,69 @@ int main(int argc, char** argv) {
     }
 
     for (unsigned int iteration = 0; iteration < options.warmup; iteration += 1) {
-      const E2ESampleStats ignored = run_once_e2e();
+      const E2ESampleStats ignored = run_once_e2e_pageable();
       (void)ignored;
     }
 
-    std::vector<double> e2e_samples_ms;
-    e2e_samples_ms.reserve(options.samples);
-    std::vector<double> h2d_copy_samples_ms;
-    h2d_copy_samples_ms.reserve(options.samples);
+    std::vector<double> pageable_e2e_samples_ms;
+    pageable_e2e_samples_ms.reserve(options.samples);
+    std::vector<double> pageable_h2d_copy_samples_ms;
+    pageable_h2d_copy_samples_ms.reserve(options.samples);
 
     for (unsigned int iteration = 0; iteration < options.samples; iteration += 1) {
-      const E2ESampleStats sample = run_once_e2e();
-      e2e_samples_ms.push_back(sample.total_ms);
-      h2d_copy_samples_ms.push_back(sample.host_to_device_copy_ms);
+      const E2ESampleStats sample = run_once_e2e_pageable();
+      pageable_e2e_samples_ms.push_back(sample.total_ms);
+      pageable_h2d_copy_samples_ms.push_back(sample.host_to_device_copy_ms);
     }
 
-    if (e2e_grand_total != reference_grand_total) {
-      std::cerr << "End-to-end GPU grand total mismatch: " << e2e_grand_total << " != "
+    if (pageable_e2e_grand_total != reference_grand_total) {
+      std::cerr << "Pageable end-to-end GPU grand total mismatch: " << pageable_e2e_grand_total
+                << " != "
                 << reference_grand_total << std::endl;
       return 5;
     }
 
-    if (e2e_average_column_sums != reference_average_column_sums) {
-      std::cerr << "End-to-end GPU averaged column sums mismatch" << std::endl;
+    if (pageable_e2e_average_column_sums != reference_average_column_sums) {
+      std::cerr << "Pageable end-to-end GPU averaged column sums mismatch" << std::endl;
       return 6;
     }
 
+    for (unsigned int iteration = 0; iteration < options.warmup; iteration += 1) {
+      const E2ESampleStats ignored = run_once_e2e_pinned();
+      (void)ignored;
+    }
+
+    std::vector<double> pinned_e2e_samples_ms;
+    pinned_e2e_samples_ms.reserve(options.samples);
+    std::vector<double> pinned_h2d_copy_samples_ms;
+    pinned_h2d_copy_samples_ms.reserve(options.samples);
+
+    for (unsigned int iteration = 0; iteration < options.samples; iteration += 1) {
+      const E2ESampleStats sample = run_once_e2e_pinned();
+      pinned_e2e_samples_ms.push_back(sample.total_ms);
+      pinned_h2d_copy_samples_ms.push_back(sample.host_to_device_copy_ms);
+    }
+
+    pinned_e2e_grand_total = pinned_grand_total[0];
+    std::copy_n(
+        pinned_average_column_sums.data, options.cols, pinned_e2e_average_column_sums.begin());
+
+    if (pinned_e2e_grand_total != reference_grand_total) {
+      std::cerr << "Pinned end-to-end GPU grand total mismatch: " << pinned_e2e_grand_total
+                << " != " << reference_grand_total << std::endl;
+      return 7;
+    }
+
+    if (pinned_e2e_average_column_sums != reference_average_column_sums) {
+      std::cerr << "Pinned end-to-end GPU averaged column sums mismatch" << std::endl;
+      return 8;
+    }
+
     const Stats resident_stats = compute_stats(resident_samples_ms);
-    const Stats e2e_stats = compute_stats(e2e_samples_ms);
-    const Stats h2d_copy_stats = compute_stats(h2d_copy_samples_ms);
+    const Stats pageable_e2e_stats = compute_stats(pageable_e2e_samples_ms);
+    const Stats pageable_h2d_copy_stats = compute_stats(pageable_h2d_copy_samples_ms);
+    const Stats pinned_e2e_stats = compute_stats(pinned_e2e_samples_ms);
+    const Stats pinned_h2d_copy_stats = compute_stats(pinned_h2d_copy_samples_ms);
     const double logical_touched_bytes =
         static_cast<double>(matrix_bytes + (3 * matrix_column_sum_bytes) +
                             average_column_bytes + (2 * matrix_total_bytes) + sizeof(double));
@@ -591,18 +643,29 @@ int main(int argc, char** argv) {
         logical_touched_bytes + matrix_bytes + average_column_bytes + sizeof(double);
     const double resident_gib_per_second =
         logical_touched_bytes / (1024.0 * 1024.0 * 1024.0) / (resident_stats.average_ms / 1000.0);
-    const double e2e_gib_per_second =
-        e2e_touched_bytes / (1024.0 * 1024.0 * 1024.0) / (e2e_stats.average_ms / 1000.0);
+    const double pageable_e2e_gib_per_second = e2e_touched_bytes / (1024.0 * 1024.0 * 1024.0) /
+                                               (pageable_e2e_stats.average_ms / 1000.0);
+    const double pinned_e2e_gib_per_second = e2e_touched_bytes / (1024.0 * 1024.0 * 1024.0) /
+                                             (pinned_e2e_stats.average_ms / 1000.0);
 
     std::cout << "[";
-    std::cout << format_result_json("e2e",
-                                    "gpu / cuda e2e batch aggregation (cuBLAS)",
+    std::cout << format_result_json("e2e-pageable",
+                                    "gpu / cuda e2e pageable batch aggregation (cuBLAS)",
                                     device.name,
-                                    e2e_stats,
-                                    e2e_gib_per_second,
-                                    e2e_grand_total,
-                                    e2e_average_column_sums,
-                                    h2d_copy_stats.average_ms);
+                                    pageable_e2e_stats,
+                                    pageable_e2e_gib_per_second,
+                                    pageable_e2e_grand_total,
+                                    pageable_e2e_average_column_sums,
+                                    pageable_h2d_copy_stats.average_ms);
+    std::cout << ",";
+    std::cout << format_result_json("e2e-pinned",
+                                    "gpu / cuda e2e pinned batch aggregation (cuBLAS)",
+                                    device.name,
+                                    pinned_e2e_stats,
+                                    pinned_e2e_gib_per_second,
+                                    pinned_e2e_grand_total,
+                                    pinned_e2e_average_column_sums,
+                                    pinned_h2d_copy_stats.average_ms);
     std::cout << ",";
     std::cout << format_result_json("resident",
                                     "gpu / cuda resident batch aggregation (cuBLAS)",

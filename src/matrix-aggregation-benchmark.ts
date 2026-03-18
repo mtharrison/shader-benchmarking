@@ -152,7 +152,7 @@ function main(): void {
     `Each run computes per-matrix column sums, averages those columns across ${options.matrices} matrices, and accumulates a grand total from the per-matrix totals.`,
   );
   console.log(
-    'If CUDA is available, the benchmark also runs explicit `e2e` and `resident` cuBLAS-backed GPU rows; otherwise it logs an error and continues.',
+    'If CUDA is available, the benchmark also runs explicit `e2e pageable`, `e2e pinned`, and `resident` cuBLAS-backed GPU rows; otherwise it logs an error and continues.',
   );
   console.log('');
 
@@ -207,11 +207,27 @@ function main(): void {
   console.log('');
   if (gpuResults && gpuResults.length > 0) {
     console.log(`GPU device: ${gpuResults[0].deviceName}`);
-    const e2eResult = gpuResults.find((result) => result.mode === 'e2e');
-    if (e2eResult && e2eResult.hostToDeviceCopyAverageMs !== null) {
-      const share = (e2eResult.hostToDeviceCopyAverageMs / e2eResult.averageMs) * 100;
+    for (const gpuResult of gpuResults) {
+      if (gpuResult.hostToDeviceCopyAverageMs === null) {
+        continue;
+      }
+
+      const share = (gpuResult.hostToDeviceCopyAverageMs / gpuResult.averageMs) * 100;
       console.log(
-        `GPU mean H2D copy time (per e2e sample): ${e2eResult.hostToDeviceCopyAverageMs.toFixed(3)} ms (${share.toFixed(2)}% of e2e avg)`,
+        `GPU mean H2D copy time (${gpuResult.mode}): ${gpuResult.hostToDeviceCopyAverageMs.toFixed(3)} ms (${share.toFixed(2)}% of ${gpuResult.name} avg)`,
+      );
+    }
+
+    const pageableResult = gpuResults.find((result) => result.mode === 'e2e-pageable');
+    const pinnedResult = gpuResults.find((result) => result.mode === 'e2e-pinned');
+    if (
+      pageableResult &&
+      pinnedResult &&
+      pageableResult.hostToDeviceCopyAverageMs !== null &&
+      pinnedResult.hostToDeviceCopyAverageMs !== null
+    ) {
+      console.log(
+        `GPU H2D pinning speedup: ${(pageableResult.hostToDeviceCopyAverageMs / pinnedResult.hostToDeviceCopyAverageMs).toFixed(2)}x`,
       );
     }
   }

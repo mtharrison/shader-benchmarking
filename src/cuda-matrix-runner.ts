@@ -10,7 +10,7 @@ export type CudaMatrixBenchmarkOptions = {
   samples: number;
 };
 
-export type CudaMatrixBenchmarkMode = 'e2e' | 'resident';
+export type CudaMatrixBenchmarkMode = 'e2e-pageable' | 'e2e-pinned' | 'resident';
 
 export type CudaMatrixBenchmarkResult = {
   mode: CudaMatrixBenchmarkMode;
